@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+	<id>homeexpenses</id>
+	<name>Consumos de Casa</name>
+	<summary>Leituras dos contadores de luz e agua e garrafas de gas, e quanto custam</summary>
+	<description><![CDATA[Regista o que a casa consome: as leituras do contador da eletricidade,
+as do contador da agua, e as garrafas de gas desde que entram ate ficarem vazias.
+
+O contador da eletricidade e lido como ele e -- com os tres registos separados (Vazio, Cheias e
+Ponta), mesmo quando o contrato so fatura dois. E uma decisao deliberada: a fatura soma Cheias e
+Ponta num unico escalao e deita fora essa distincao, e depois de deitada fora nao se recupera.
+Guardando os tres em bruto, a app consegue responder com exatidao -- nao por estimativa -- a
+pergunta "o tri-horario sairia mais barato do que o bi-horario que tenho?".
+
+Nas garrafas de gas, a pergunta e quanto tempo rende uma garrafa. Isso sai da data em que entrou
+e da data em que acabou; pesagens pelo meio dao o nivel atual e o ritmo de consumo, calculados a
+partir da tara gravada na gola da propria garrafa.
+
+Nada do que se deriva e guardado: o consumo entre leituras, o nivel da garrafa e a comparacao
+entre tarifarios sao sempre calculados a partir dos valores em bruto. Guardados, ficariam errados
+a primeira vez que se corrigisse uma leitura.
+
+Pensada para ser usada a mao e por um agente: toda a API e OCS, chamavel com uma app password.]]></description>
+	<version>0.1.0</version>
+	<licence>AGPL-3.0-or-later</licence>
+	<author mail="ricardo@grangeia.pt">Ricardo</author>
+	<namespace>HomeExpenses</namespace>
+	<category>tools</category>
+	<category>organization</category>
+	<bugs>https://github.com/ricgrangeia/nextcloud-homeexpenses/issues</bugs>
+	<repository type="git">https://github.com/ricgrangeia/nextcloud-homeexpenses.git</repository>
+	<website>https://github.com/ricgrangeia/nextcloud-homeexpenses</website>
+	<dependencies>
+		<php min-version="8.2" max-version="8.5"/>
+		<database min-version="8.0">mysql</database>
+		<database>pgsql</database>
+		<database>sqlite</database>
+		<nextcloud min-version="34" max-version="35"/>
+	</dependencies>
+	<navigations>
+		<navigation>
+			<id>homeexpenses</id>
+			<name>Consumos de Casa</name>
+			<route>homeexpenses.page.index</route>
+			<icon>app.svg</icon>
+			<type>link</type>
+		</navigation>
+	</navigations>
+</info>

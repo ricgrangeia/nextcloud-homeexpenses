@@ -1,0 +1,35 @@
+{
+	"name": "homeexpenses",
+	"version": "1.0.0",
+	"license": "AGPL-3.0-or-later",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "vite build",
+		"dev": "vite --mode development build",
+		"watch": "vite --mode development build --watch"
+	},
+	"browserslist": [
+		"extends @nextcloud/browserslist-config"
+	],
+	"dependencies": {
+		"@nextcloud/axios": "^2.6.0",
+		"@nextcloud/dialogs": "^7.4.1",
+		"@nextcloud/l10n": "^3.4.1",
+		"@nextcloud/router": "^3.1.0",
+		"@nextcloud/vue": "^9.9.0",
+		"vue": "^3.5.41",
+		"vue-material-design-icons": "^5.3.0",
+		"vue-router": "^5.2.0"
+	},
+	"devDependencies": {
+		"@nextcloud/browserslist-config": "^3.1.2",
+		"@nextcloud/vite-config": "^2.5.4",
+		"typescript": "5.9.3",
+		"vite": "^7.3.6"
+	},
+	"engines": {
+		"node": "^22.0.0",
+		"npm": "^10.0.0"
+	}
+}
