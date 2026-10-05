@@ -28,9 +28,9 @@ Pensada para ser usada a mao e por um agente: toda a API e OCS, chamavel com uma
 	<namespace>HomeExpenses</namespace>
 	<category>tools</category>
 	<category>organization</category>
+	<website>https://github.com/ricgrangeia/nextcloud-homeexpenses</website>
 	<bugs>https://github.com/ricgrangeia/nextcloud-homeexpenses/issues</bugs>
 	<repository type="git">https://github.com/ricgrangeia/nextcloud-homeexpenses.git</repository>
-	<website>https://github.com/ricgrangeia/nextcloud-homeexpenses</website>
 	<dependencies>
 		<php min-version="8.2" max-version="8.5"/>
 		<database min-version="8.0">mysql</database>
