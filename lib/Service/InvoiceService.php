@@ -10,8 +10,10 @@ use OCA\HomeExpenses\Db\InvoiceLine;
 use OCA\HomeExpenses\Db\InvoiceLineMapper;
 use OCA\HomeExpenses\Db\InvoiceMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
+use OCP\AppFramework\Db\TTransactional;
 use OCP\Http\Client\IClientService;
 use OCP\IAppConfig;
+use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -27,6 +29,8 @@ use Psr\Log\LoggerInterface;
  * exatamente como a interface o faz.
  */
 class InvoiceService {
+	use TTransactional;
+
 	private const DEFAULT_ENDPOINT = 'https://qrcode.appa8.com';
 	private const CONFIG_KEY = 'invoice_reader_url';
 
@@ -36,6 +40,7 @@ class InvoiceService {
 		private InvoiceParser $parser,
 		private IClientService $clientService,
 		private IAppConfig $appConfig,
+		private IDBConnection $db,
 		private LoggerInterface $logger,
 	) {
 	}
@@ -84,7 +89,19 @@ class InvoiceService {
 				continue;
 			}
 
-			$created[] = $this->persist($userId, $doc, $filename, $meterId)->jsonSerialize();
+			// Atomico de proposito. A leitura do PDF demora, e se o processo
+			// morrer a meio de gravar -- o utilizador fecha o separador, o PHP
+			// detecta a ligacao caida ao escrever a resposta -- uma gravacao
+			// parcial deixaria a fatura com metade das linhas. E pior do que
+			// parece: o ATCUD torna a importacao idempotente, por isso
+			// reimportar o mesmo PDF daria a fatura por ja existente e nunca
+			// mais completava as linhas em falta. Ficaria errada para sempre,
+			// com ar de certa.
+			$invoice = $this->atomic(
+				fn () => $this->persist($userId, $doc, $filename, $meterId),
+				$this->db
+			);
+			$created[] = $invoice->jsonSerialize();
 		}
 
 		return [

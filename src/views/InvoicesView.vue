@@ -27,7 +27,9 @@
 
 		<p v-if="busy" class="he-hint">
 			A leitura renderiza as páginas e procura os QR codes; num PDF de várias páginas demora
-			até um minuto.
+			até um minuto. Podes sair — o pedido já está no servidor e a gravação é atómica, por
+			isso ou fica a fatura inteira ou não fica nada. O que se perde ao sair são os avisos
+			desta importação.
 		</p>
 
 		<div v-if="lastResult" class="he-card">
@@ -115,7 +117,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import NcButton from '@nextcloud/vue/components/NcButton'
 import NcSelect from '@nextcloud/vue/components/NcSelect'
 import NcLoadingIcon from '@nextcloud/vue/components/NcLoadingIcon'
@@ -134,6 +136,27 @@ const meterId = ref(null)
 const lastResult = ref(null)
 
 const meterOptions = computed(() => meters.value.map((m) => ({ value: m.id, label: m.name })))
+
+/**
+ * Sair a meio da importação não cancela a leitura — o pedido já está no
+ * servidor, e a gravação é atómica, por isso ou fica tudo ou não fica nada.
+ * O que se perde é o resultado: quais documentos entraram e, sobretudo, os
+ * avisos. Daí valer a pena travar a saída em vez de a deixar passar calada.
+ */
+const guard = (event) => {
+	event.preventDefault()
+	event.returnValue = ''
+}
+
+watch(busy, (running) => {
+	if (running) {
+		window.addEventListener('beforeunload', guard)
+	} else {
+		window.removeEventListener('beforeunload', guard)
+	}
+})
+
+onBeforeUnmount(() => window.removeEventListener('beforeunload', guard))
 
 const totalKwh = (invoice) =>
 	invoice.consumption.reduce((sum, row) => sum + (row.quantity ?? 0), 0)
