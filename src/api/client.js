@@ -59,14 +59,18 @@ export default {
 	getInvoice: (id) => request('get', `/invoices/${id}`),
 	updateInvoice: (id, data) => request('put', `/invoices/${id}`, { data }),
 	deleteInvoice: (id) => request('delete', `/invoices/${id}`),
-	importInvoice: (file, meterId) => {
+	// Varios ficheiros de uma vez. Devolve logo: a leitura e feita em fundo.
+	importInvoices: (files, meterId) => {
 		const body = new FormData()
-		body.append('file', file, file.name)
+		for (const file of files) {
+			body.append('file[]', file, file.name)
+		}
 		if (meterId) {
 			body.append('meterId', String(meterId))
 		}
 		return ocs.post(`${base}/invoices/import`, body).then(unwrap)
 	},
+	listImports: () => request('get', '/invoices/imports'),
 
 	// Previsao
 	forecast: (meterId, days) => request('get', `/meters/${meterId}/forecast`, { params: { days } }),

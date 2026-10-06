@@ -6,7 +6,7 @@ namespace OCA\HomeExpenses\Controller;
 
 use OCA\HomeExpenses\Service\ForecastService;
 use OCA\HomeExpenses\Service\GasService;
-use OCA\HomeExpenses\Service\InvoiceImportException;
+use OCA\HomeExpenses\Service\ImportQueue;
 use OCA\HomeExpenses\Service\InvoiceService;
 use OCA\HomeExpenses\Service\MeterService;
 use OCA\HomeExpenses\Service\ReadingService;
@@ -43,6 +43,7 @@ class ApiController extends OCSController {
 		private GasService $gasService,
 		private TariffService $tariffService,
 		private InvoiceService $invoiceService,
+		private ImportQueue $importQueue,
 		private ForecastService $forecastService,
 		private IUserSession $userSession,
 	) {
@@ -111,7 +112,8 @@ class ApiController extends OCSController {
 				. 'e isso que permite ao endpoint /compare responder com exatidao se o tri-horario sairia mais '
 				. 'barato. Ao criar o contador, passa registerCodes=["V","C","P"] mesmo com tariffOption="bi".',
 			'quickReference' => [
-				'POST /api/v1/invoices/import' => 'Importa uma fatura em PDF. O ficheiro vai em multipart no campo "file", ou em base64 no corpo JSON em "content" (com "filename"). Opcional: "meterId". Devolve {created, existing, warnings}. LE SEMPRE os avisos: uma linha de energia que nao entre nos totais aparece la, e ignora-la deixa o total a menos com ar de certo.',
+				'POST /api/v1/invoices/import' => 'Poe uma ou mais faturas em PDF na FILA. Devolve 202 e nao espera pela leitura, que demora ate um minuto por ficheiro. Multipart em "file" (ou "file[]" para varios), ou um em base64 em "content" (com "filename"). Opcional: "meterId". O resultado chega por notificacao do Nextcloud e fica em GET /api/v1/invoices/imports.',
+				'GET /api/v1/invoices/imports' => 'Estado da fila, mais recente primeiro. Cada item tem status (pending|running|done|failed) e, quando terminado, "result" com {created, existing, warnings}. LE SEMPRE os avisos: uma linha de energia que nao entre nos totais aparece la, e ignora-la deixa o total a menos com ar de certo.',
 				'GET /api/v1/invoices' => 'Faturas importadas, com o consumo por escalao ja somado (as linhas vem partidas por taxa de IVA na fatura; aqui ja estao juntas). Filtro opcional: meterId.',
 				'GET /api/v1/invoices/{id}' => 'Uma fatura: as linhas como vieram do fornecedor, mais o consumo agregado.',
 				'PUT /api/v1/invoices/{id}' => 'Liga a fatura a um contador (meterId), ou desliga com meterId nulo.',
@@ -638,20 +640,16 @@ class ApiController extends OCSController {
 	// ---------------------------------------------------------------- Faturas
 
 	/**
-	 * Importa uma fatura em PDF.
+	 * Poe uma ou mais faturas em PDF na fila de importacao.
 	 *
-	 * O PDF e lido por um servico externo que descodifica o QR fiscal ATCUD e
-	 * extrai as linhas; a chamada e feita do lado do servidor para que isto
-	 * seja um endpoint como os outros.
+	 * Devolve logo, sem ler nada: a leitura de um PDF demora ate um minuto e
+	 * nao e trabalho para um pedido web. Fica em fila, e o resultado chega
+	 * pelas notificacoes do Nextcloud -- e fica tambem em
+	 * GET /api/v1/invoices/imports, que e onde estao os avisos por inteiro.
 	 *
-	 * Um PDF pode conter mais do que um documento fiscal -- numa fatura da EDP,
-	 * a eletricidade e a Contribuicao Audiovisual vem separadas -- por isso a
-	 * resposta e uma lista. O ATCUD torna a operacao idempotente: reimportar o
-	 * mesmo ficheiro devolve os documentos em `existing` e nao duplica nada.
-	 *
-	 * Envia-se o PDF como `multipart/form-data` no campo `file`, ou em base64
-	 * no corpo JSON em `content`. O segundo existe para um agente que nao
-	 * consiga montar um multipart.
+	 * Aceita varios ficheiros no mesmo pedido (`file[]` em multipart), ou um
+	 * em base64 no corpo JSON em `content`. O segundo existe para um agente
+	 * que nao consiga montar um multipart.
 	 */
 	#[NoAdminRequired]
 	#[ApiRoute(verb: 'POST', url: '/api/v1/invoices/import')]
@@ -660,34 +658,90 @@ class ApiController extends OCSController {
 		?string $filename = null,
 		?int $meterId = null,
 	): DataResponse {
-		$uploaded = $this->request->getUploadedFile('file');
+		$files = $this->uploadedFiles();
 
-		if (is_array($uploaded) && ($uploaded['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
-			$bytes = (string)file_get_contents($uploaded['tmp_name']);
-			$name = (string)($uploaded['name'] ?? 'fatura.pdf');
-		} elseif ($content !== null && $content !== '') {
+		if ($files === [] && $content !== null && $content !== '') {
 			$bytes = base64_decode($content, true);
 			if ($bytes === false) {
 				return $this->badRequest('O campo "content" tem de ser base64 valido.');
 			}
-			$name = $filename ?? 'fatura.pdf';
-		} else {
+			$files[] = ['name' => $filename ?? 'fatura.pdf', 'bytes' => $bytes];
+		}
+
+		if ($files === []) {
 			return $this->badRequest(
-				'Falta o ficheiro: envia o PDF em multipart no campo "file", ou em base64 em "content".'
+				'Falta o ficheiro: envia os PDF em multipart no campo "file" (ou "file[]" para '
+				. 'varios), ou um em base64 em "content".'
 			);
 		}
 
-		if ($bytes === '') {
-			return $this->badRequest('O ficheiro esta vazio.');
+		$queued = [];
+		$rejected = [];
+		foreach ($files as $file) {
+			if ($file['bytes'] === '') {
+				$rejected[] = ['filename' => $file['name'], 'reason' => 'ficheiro vazio'];
+				continue;
+			}
+			$queued[] = $this->importQueue
+				->enqueue($this->getUserId(), $file['bytes'], $file['name'], $meterId)
+				->jsonSerialize();
 		}
 
-		try {
-			$result = $this->invoiceService->import($this->getUserId(), $bytes, $name, $meterId);
-		} catch (InvoiceImportException $e) {
-			return $this->badRequest($e->getMessage());
+		return new DataResponse([
+			'queued' => $queued,
+			'rejected' => $rejected,
+			'note' => 'As faturas sao lidas em fundo. O resultado chega pelas notificacoes do '
+				. 'Nextcloud, e fica em GET /api/v1/invoices/imports com os avisos por inteiro.',
+		], Http::STATUS_ACCEPTED);
+	}
+
+	/**
+	 * O estado da fila de importacao, mais recente primeiro.
+	 *
+	 * E aqui que estao os avisos completos de cada importacao. A notificacao
+	 * diz quantos ha; o que eles dizem esta neste endpoint.
+	 */
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'GET', url: '/api/v1/invoices/imports')]
+	public function listImports(): DataResponse {
+		return new DataResponse($this->importQueue->findAllForUser($this->getUserId()));
+	}
+
+	/**
+	 * Normaliza o que o PHP poe em $_FILES, que tem formas diferentes para um
+	 * ficheiro e para varios.
+	 *
+	 * @return list<array{name: string, bytes: string}>
+	 */
+	private function uploadedFiles(): array {
+		$uploaded = $this->request->getUploadedFile('file');
+		if (!is_array($uploaded)) {
+			return [];
 		}
 
-		return new DataResponse($result);
+		// Varios: cada chave e um array paralelo.
+		if (is_array($uploaded['error'] ?? null)) {
+			$out = [];
+			foreach ($uploaded['error'] as $i => $error) {
+				if ($error !== UPLOAD_ERR_OK) {
+					continue;
+				}
+				$out[] = [
+					'name' => (string)($uploaded['name'][$i] ?? 'fatura.pdf'),
+					'bytes' => (string)file_get_contents($uploaded['tmp_name'][$i]),
+				];
+			}
+			return $out;
+		}
+
+		if (($uploaded['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+			return [];
+		}
+
+		return [[
+			'name' => (string)($uploaded['name'] ?? 'fatura.pdf'),
+			'bytes' => (string)file_get_contents($uploaded['tmp_name']),
+		]];
 	}
 
 	#[NoAdminRequired]

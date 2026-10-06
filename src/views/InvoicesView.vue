@@ -17,33 +17,41 @@
 		</div>
 
 		<form class="he-form" @submit.prevent="upload">
-			<input ref="fileInput" type="file" accept="application/pdf" @change="pick">
+			<input ref="fileInput" type="file" accept="application/pdf" multiple @change="pick">
 			<NcSelect v-if="meters.length" v-model="meterId" :options="meterOptions"
 				:reduce="(o) => o.value" label="label" input-label="Contador" />
-			<NcButton type="primary" native-type="submit" :disabled="!file || busy">
-				{{ busy ? 'A ler…' : 'Importar' }}
+			<NcButton type="primary" native-type="submit" :disabled="!files.length || busy">
+				{{ files.length > 1 ? `Importar ${files.length} faturas` : 'Importar' }}
 			</NcButton>
 		</form>
 
-		<p v-if="busy" class="he-hint">
-			A leitura renderiza as páginas e procura os QR codes; num PDF de várias páginas demora
-			até um minuto. Podes sair — o pedido já está no servidor e a gravação é atómica, por
-			isso ou fica a fatura inteira ou não fica nada. O que se perde ao sair são os avisos
-			desta importação.
+		<p class="he-hint">
+			Podes enviar várias de uma vez. Ficam em fila e são lidas em segundo plano — podes
+			fechar a página. O Nextcloud notifica-te quando cada uma estiver pronta.
 		</p>
 
-		<div v-if="lastResult" class="he-card">
-			<div class="he-card-head">
-				<strong>
-					{{ lastResult.created.length }} documento(s) importado(s)<template
-						v-if="lastResult.existing.length">, {{ lastResult.existing.length }} já existia(m)</template>
-				</strong>
+		<template v-if="queue.length">
+			<h3>Fila de importação</h3>
+			<div v-for="job in queue" :key="job.id" class="he-card">
+				<div class="he-card-head">
+					<strong>{{ job.filename }}</strong>
+					<span class="he-hint" style="margin:0">{{ statusLabel(job) }}</span>
+				</div>
+
+				<div v-if="job.status === 'failed'" class="he-warn">{{ job.error }}</div>
+
+				<template v-if="job.result">
+					<p class="he-hint" style="margin:0 0 8px">
+						{{ job.result.created.length }} documento(s) importado(s)<template
+							v-if="job.result.existing.length">, {{ job.result.existing.length }}
+							já existia(m) — reconhecidos pelo ATCUD, não duplicados</template>.
+					</p>
+					<div v-for="(warning, i) in job.result.warnings" :key="i" class="he-warn">
+						{{ warning }}
+					</div>
+				</template>
 			</div>
-			<p v-if="lastResult.existing.length" class="he-hint" style="margin:0 0 8px">
-				Um documento já importado é reconhecido pelo ATCUD e não é duplicado.
-			</p>
-			<div v-for="(warning, i) in lastResult.warnings" :key="i" class="he-warn">{{ warning }}</div>
-		</div>
+		</template>
 
 		<NcLoadingIcon v-if="loading" :size="32" />
 		<p v-else-if="!invoices.length" class="he-empty">Ainda não há faturas importadas.</p>
@@ -117,7 +125,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import NcButton from '@nextcloud/vue/components/NcButton'
 import NcSelect from '@nextcloud/vue/components/NcSelect'
 import NcLoadingIcon from '@nextcloud/vue/components/NcLoadingIcon'
@@ -130,47 +138,70 @@ const loading = ref(true)
 const busy = ref(false)
 const invoices = ref([])
 const meters = ref([])
-const file = ref(null)
+const files = ref([])
 const fileInput = ref(null)
 const meterId = ref(null)
-const lastResult = ref(null)
+const queue = ref([])
+let poller = null
 
 const meterOptions = computed(() => meters.value.map((m) => ({ value: m.id, label: m.name })))
 
-/**
- * Sair a meio da importação não cancela a leitura — o pedido já está no
- * servidor, e a gravação é atómica, por isso ou fica tudo ou não fica nada.
- * O que se perde é o resultado: quais documentos entraram e, sobretudo, os
- * avisos. Daí valer a pena travar a saída em vez de a deixar passar calada.
- */
-const guard = (event) => {
-	event.preventDefault()
-	event.returnValue = ''
+const STATUS = {
+	pending: 'na fila',
+	running: 'a ler…',
+	done: 'pronta',
+	failed: 'falhou',
 }
 
-watch(busy, (running) => {
-	if (running) {
-		window.addEventListener('beforeunload', guard)
-	} else {
-		window.removeEventListener('beforeunload', guard)
+const statusLabel = (job) => {
+	if (job.status === 'pending' && job.attempts > 0) {
+		return `a repetir (tentativa ${job.attempts + 1})`
 	}
-})
+	return STATUS[job.status] ?? job.status
+}
 
-onBeforeUnmount(() => window.removeEventListener('beforeunload', guard))
+const pendingWork = computed(() =>
+	queue.value.some((job) => job.status === 'pending' || job.status === 'running'))
 
 const totalKwh = (invoice) =>
 	invoice.consumption.reduce((sum, row) => sum + (row.quantity ?? 0), 0)
 
 const pick = (event) => {
-	file.value = event.target.files?.[0] ?? null
+	files.value = Array.from(event.target.files ?? [])
 }
+
+/**
+ * Enquanto houver trabalho na fila, pergunta de vez em quando. O cron do
+ * Nextcloud corre tipicamente de 5 em 5 minutos, por isso não vale a pena
+ * perguntar depressa — isto é só para a página se atualizar sozinha a quem
+ * ficar a olhar.
+ */
+const poll = () => {
+	clearInterval(poller)
+	if (!pendingWork.value) {
+		return
+	}
+	poller = setInterval(async () => {
+		queue.value = await api.listImports()
+		if (!pendingWork.value) {
+			clearInterval(poller)
+			await load()
+		}
+	}, 10000)
+}
+
+onBeforeUnmount(() => clearInterval(poller))
 
 const load = async () => {
 	loading.value = true
 	try {
-		const [list, meterList] = await Promise.all([api.listInvoices(), api.listMeters()])
+		const [list, meterList, jobs] = await Promise.all([
+			api.listInvoices(), api.listMeters(), api.listImports(),
+		])
 		invoices.value = list
 		meters.value = meterList
+		queue.value = jobs
+		poll()
 		if (meterId.value === null && meterList.length === 1) {
 			meterId.value = meterList[0].id
 		}
@@ -182,23 +213,25 @@ const load = async () => {
 }
 
 const upload = async () => {
-	if (!file.value) {
+	if (!files.value.length) {
 		return
 	}
 	busy.value = true
-	lastResult.value = null
 	try {
-		lastResult.value = await api.importInvoice(file.value, meterId.value)
-		if (lastResult.value.created.length) {
-			showSuccess(`${lastResult.value.created.length} documento(s) importado(s).`)
-		}
-		file.value = null
+		const result = await api.importInvoices(files.value, meterId.value)
+		showSuccess(
+			result.queued.length === 1
+				? 'Fatura na fila. Serás notificado quando estiver lida.'
+				: `${result.queued.length} faturas na fila. Serás notificado à medida que forem lidas.`
+		)
+		files.value = []
 		if (fileInput.value) {
 			fileInput.value.value = ''
 		}
-		await load()
+		queue.value = await api.listImports()
+		poll()
 	} catch (error) {
-		showError(error?.response?.data?.ocs?.data?.message ?? 'Não foi possível ler a fatura.')
+		showError(error?.response?.data?.ocs?.data?.message ?? 'Não foi possível pôr na fila.')
 	} finally {
 		busy.value = false
 	}

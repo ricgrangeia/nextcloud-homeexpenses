@@ -117,14 +117,22 @@ fiscal**. Numa fatura real, a extração sem essa conferência somava 91,04 € 
 conferência, uma fatura que não feche fica marcada e não entra em contas.
 
 ```bash
+# Várias de uma vez. Devolve 202 e não espera.
 curl -u 'utilizador:app-password' -H 'OCS-APIRequest: true' \
-  -F 'file=@fatura.pdf' -F 'meterId=1' \
+  -F 'file[]=@fatura-setembro.pdf' -F 'file[]=@fatura-outubro.pdf' -F 'meterId=1' \
   "$BASE/invoices/import"
+
+# O resultado, quando estiver pronto
+curl $AUTH "$BASE/invoices/imports"
 ```
 
-A resposta traz `{created, existing, warnings}`. **Lê sempre os avisos**: uma linha de
-energia que não entre nos totais aparece lá, e ignorá-la deixa o total a menos com ar de
-certo.
+Ler um PDF demora até um minuto, o que é demasiado para um pedido web. As faturas ficam em
+**fila** e são lidas por um trabalho de fundo; podes fechar a página. Cada uma gera uma
+**notificação do Nextcloud** quando termina.
+
+O estado fica em `GET /api/v1/invoices/imports`, e é lá que estão os avisos por inteiro — a
+notificação diz quantos há, não o que dizem. **Lê sempre os avisos**: uma linha de energia
+que não entre nos totais aparece lá, e ignorá-la deixa o total a menos com ar de certo.
 
 Três coisas que uma fatura da EDP faz, e que moldam o que a app guarda:
 
