@@ -22,7 +22,7 @@ entre tarifarios sao sempre calculados a partir dos valores em bruto. Guardados,
 a primeira vez que se corrigisse uma leitura.
 
 Pensada para ser usada a mao e por um agente: toda a API e OCS, chamavel com uma app password.]]></description>
-	<version>0.2.2</version>
+	<version>0.3.0</version>
 	<licence>AGPL-3.0-or-later</licence>
 	<author mail="ricardo@grangeia.pt">Ricardo</author>
 	<namespace>HomeExpenses</namespace>
