@@ -258,4 +258,113 @@ class ForecastServiceTest extends TestCase {
 
 		$this->assertSame([], $periods);
 	}
+
+	// --------------------------------------------- Serie unificada (graficos)
+
+	public function testSerieUnificadaDizDeOndeVeioCadaPeriodo(): void {
+		$readings = $this->service->fromSeries([[
+			'from' => '2026-09-01', 'to' => '2026-09-30',
+			'byRegister' => ['V' => ['consumed' => 30.0], 'FV' => ['consumed' => 60.0]],
+		]]);
+		$invoices = $this->service->fromInvoices([
+			['periodFrom' => '2026-06-01', 'periodTo' => '2026-06-30', 'registerCode' => 'V',
+				'quantity' => 45.0, 'isEstimate' => false],
+		]);
+
+		$series = $this->service->unified($readings, $invoices);
+
+		$this->assertSame(['FV', 'V'], $series['registers']);
+		$this->assertSame('invoice', $series['periods'][0]['source']);
+		$this->assertSame('reading', $series['periods'][1]['source']);
+	}
+
+	/**
+	 * O consumo por dia e o que torna periodos de duracoes diferentes
+	 * comparaveis. Sem ele, num grafico a barra maior pode ser so a mais
+	 * comprida -- 90 kWh em 30 dias gasta-se menos depressa do que 45 em 9.
+	 */
+	public function testConsumoPorDiaTornaPeriodosDesiguaisComparaveis(): void {
+		$series = $this->service->unified($this->service->fromSeries([
+			['from' => '2026-09-01', 'to' => '2026-09-30',
+				'byRegister' => ['V' => ['consumed' => 90.0]]],
+			['from' => '2026-09-30', 'to' => '2026-10-09',
+				'byRegister' => ['V' => ['consumed' => 45.0]]],
+		]), []);
+
+		$longo = $series['periods'][0];
+		$curto = $series['periods'][1];
+
+		$this->assertSame(90.0, $longo['total']);
+		$this->assertSame(45.0, $curto['total'], 'o total do curto e menor...');
+		$this->assertSame(29, $longo['days']);
+		$this->assertSame(9, $curto['days']);
+		$this->assertGreaterThan($longo['totalPerDay'], $curto['totalPerDay'],
+			'...mas gasta-se mais depressa, e e isso que o grafico tem de deixar ver');
+	}
+
+	public function testSerieUnificadaNaoDuplicaPeriodosSobrepostos(): void {
+		$readings = $this->service->fromSeries([[
+			'from' => '2026-09-01', 'to' => '2026-09-30',
+			'byRegister' => ['V' => ['consumed' => 30.0], 'C' => ['consumed' => 20.0]],
+		]]);
+		$invoices = $this->service->fromInvoices([
+			['periodFrom' => '2026-09-01', 'periodTo' => '2026-09-30', 'registerCode' => 'V',
+				'quantity' => 30.0, 'isEstimate' => false],
+		]);
+
+		$series = $this->service->unified($readings, $invoices);
+
+		$this->assertCount(1, $series['periods']);
+		$this->assertSame('reading', $series['periods'][0]['source']);
+		$this->assertSame(1, $series['used']['reconciled']);
+	}
+
+	/**
+	 * Uma estimativa da distribuidora foi COBRADA: e dinheiro real, nao ruido
+	 * a esconder. Quando uma leitura cobre o mesmo intervalo, a fatura nao se
+	 * soma (seria contar duas vezes) nem se deita fora -- fica ao lado, para
+	 * se ver quanto a estimativa se afastou do contador.
+	 */
+	public function testFaturaEstimadaFicaAoLadoDaLeituraComADiferenca(): void {
+		$readings = $this->service->fromSeries([[
+			'from' => '2026-09-01', 'to' => '2026-09-30',
+			'byRegister' => ['V' => ['consumed' => 40.0], 'FV' => ['consumed' => 60.0]],
+		]]);
+		$invoices = $this->service->fromInvoices([
+			['periodFrom' => '2026-09-01', 'periodTo' => '2026-09-30', 'registerCode' => 'V',
+				'quantity' => 50.0, 'isEstimate' => true],
+			['periodFrom' => '2026-09-01', 'periodTo' => '2026-09-30', 'registerCode' => 'FV',
+				'quantity' => 70.0, 'isEstimate' => true],
+		]);
+
+		$period = $this->service->unified($readings, $invoices)['periods'][0];
+
+		$this->assertSame(100.0, $period['total'], 'a serie usa o contador');
+		$this->assertSame(120.0, $period['billed']['total'], 'a fatura fica ao lado');
+		$this->assertTrue($period['billed']['isEstimate']);
+		$this->assertSame(20.0, $period['billed']['difference'],
+			'cobraram 20 a mais do que o contador andou');
+	}
+
+	/**
+	 * Se os intervalos nao coincidirem, mostram-se os dois e nao se calcula
+	 * diferenca. Repartir consumo por dias para os fazer bater inventaria uma
+	 * distribuicao que ninguem mediu, e o numero teria ar de exacto.
+	 */
+	public function testNaoCalculaDiferencaQuandoOsIntervalosNaoCoincidem(): void {
+		$readings = $this->service->fromSeries([[
+			'from' => '2026-09-05', 'to' => '2026-10-04',
+			'byRegister' => ['V' => ['consumed' => 100.0]],
+		]]);
+		$invoices = $this->service->fromInvoices([
+			['periodFrom' => '2026-09-01', 'periodTo' => '2026-09-30', 'registerCode' => 'V',
+				'quantity' => 120.0, 'isEstimate' => true],
+		]);
+
+		$billed = $this->service->unified($readings, $invoices)['periods'][0]['billed'];
+
+		$this->assertFalse($billed['sameSpan']);
+		$this->assertNull($billed['difference']);
+		$this->assertSame(120.0, $billed['total'], 'mostra-se na mesma o que foi cobrado');
+	}
 }

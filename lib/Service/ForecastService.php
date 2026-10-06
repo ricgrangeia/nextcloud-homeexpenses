@@ -299,24 +299,30 @@ class ForecastService {
 	public function merge(array $fromReadings, array $fromInvoices): array {
 		$periods = $fromReadings;
 		$kept = 0;
-		$discarded = 0;
+		$reconciled = 0;
 
 		foreach ($fromInvoices as $invoicePeriod) {
-			$overlaps = false;
-			foreach ($fromReadings as $readingPeriod) {
-				if ($this->overlaps($invoicePeriod, $readingPeriod)) {
-					$overlaps = true;
+			$match = null;
+			foreach ($periods as $index => $readingPeriod) {
+				if (($readingPeriod['source'] ?? 'reading') === 'reading'
+					&& $this->overlaps($invoicePeriod, $readingPeriod)) {
+					$match = $index;
 					break;
 				}
 			}
 
-			if ($overlaps) {
-				$discarded++;
+			if ($match === null) {
+				$periods[] = $invoicePeriod;
+				$kept++;
 				continue;
 			}
 
-			$periods[] = $invoicePeriod;
-			$kept++;
+			// Sobrepoe-se a uma leitura: nao entra na serie, para nao contar
+			// o mesmo consumo duas vezes, mas tambem nao se perde. Fica
+			// anexado como o que foi FACTURADO naquele intervalo, que e o que
+			// permite ver quanto a estimativa se afastou do contador.
+			$periods[$match]['billed'] = $this->billedAgainst($invoicePeriod, $periods[$match]);
+			$reconciled++;
 		}
 
 		return [
@@ -324,8 +330,44 @@ class ForecastService {
 			'used' => [
 				'readings' => count($fromReadings),
 				'invoices' => $kept,
-				'discarded' => $discarded,
+				'reconciled' => $reconciled,
+				// Mantido pelo nome antigo: nada e deitado fora, mas ha
+				// consumidores desta chave.
+				'discarded' => $reconciled,
 			],
+		];
+	}
+
+	/**
+	 * O que a fatura cobrou, posto ao lado do que o contador mediu.
+	 *
+	 * A diferenca so se calcula quando os intervalos coincidem exactamente.
+	 * Quando nao coincidem, mostram-se os dois e diz-se que nao coincidem --
+	 * repartir consumo por dias para os fazer bater seria inventar uma
+	 * distribuicao que ninguem mediu, e o numero resultante teria ar de
+	 * exacto.
+	 *
+	 * @return array
+	 */
+	private function billedAgainst(array $invoice, array $reading): array {
+		$billedTotal = array_sum(array_map('floatval', $invoice['byRegister']));
+		$readTotal = array_sum(array_map('floatval', $reading['byRegister']));
+
+		$sameSpan = $invoice['periodFrom'] === $reading['periodFrom']
+			&& $invoice['periodTo'] === $reading['periodTo'];
+
+		return [
+			'from' => $invoice['periodFrom'],
+			'to' => $invoice['periodTo'],
+			'byRegister' => array_map(
+				static fn ($q) => round((float)$q, 3),
+				$invoice['byRegister']
+			),
+			'total' => round($billedTotal, 3),
+			'isEstimate' => (bool)($invoice['isEstimate'] ?? false),
+			'sameSpan' => $sameSpan,
+			// Positivo: a fatura cobrou mais do que o contador andou.
+			'difference' => $sameSpan ? round($billedTotal - $readTotal, 3) : null,
 		];
 	}
 
@@ -382,6 +424,70 @@ class ForecastService {
 		}
 
 		return array_values($byPeriod);
+	}
+
+	/**
+	 * A serie unificada, pronta para tabela e grafico.
+	 *
+	 * E a mesma juncao que alimenta a previsao, mas com o que falta para se
+	 * poder olhar para ela: dias, consumo por dia, e de onde veio cada
+	 * periodo.
+	 *
+	 * O `perDay` nao e enfeite. Os periodos tem duracoes diferentes -- uma
+	 * fatura de 31 dias ao lado de um intervalo de 9 entre leituras -- e
+	 * comparar totais de periodos desiguais e a maneira mais facil de ler mal
+	 * um grafico: a barra maior pode ser so a mais comprida.
+	 *
+	 * @param list<array> $fromReadings
+	 * @param list<array> $fromInvoices
+	 * @return array{periods: list<array>, registers: list<string>, used: array}
+	 */
+	public function unified(array $fromReadings, array $fromInvoices): array {
+		$merged = $this->merge($fromReadings, $fromInvoices);
+
+		$registers = [];
+		$periods = [];
+
+		foreach ($merged['periods'] as $period) {
+			$days = $this->days($period['periodFrom'], $period['periodTo']);
+			$byRegister = [];
+			$total = 0.0;
+
+			foreach ($period['byRegister'] as $code => $quantity) {
+				$registers[$code] = true;
+				$byRegister[$code] = [
+					'consumed' => round((float)$quantity, 3),
+					'perDay' => $days > 0 ? round((float)$quantity / $days, 4) : null,
+				];
+				$total += (float)$quantity;
+			}
+
+			$entry = [
+				'from' => $period['periodFrom'],
+				'to' => $period['periodTo'],
+				'days' => $days,
+				'source' => $period['source'] ?? 'reading',
+				'isEstimate' => (bool)($period['isEstimate'] ?? false),
+				'byRegister' => $byRegister,
+				'total' => round($total, 3),
+				'totalPerDay' => $days > 0 ? round($total / $days, 4) : null,
+			];
+
+			// O que a fatura cobrou pelo mesmo intervalo, quando existe.
+			// Nao substitui a leitura nem se soma a ela -- fica ao lado, para
+			// se ver o desvio. Uma estimativa da distribuidora foi COBRADA, e
+			// por isso e um facto que tem de aparecer, nao ruido a esconder.
+			if (isset($period['billed'])) {
+				$entry['billed'] = $period['billed'];
+			}
+
+			$periods[] = $entry;
+		}
+
+		$codes = array_keys($registers);
+		sort($codes);
+
+		return ['periods' => $periods, 'registers' => $codes, 'used' => $merged['used']];
 	}
 
 	private function confidence(int $daysObserved): string {

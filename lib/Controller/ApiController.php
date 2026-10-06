@@ -118,6 +118,7 @@ class ApiController extends OCSController {
 				'GET /api/v1/invoices/{id}' => 'Uma fatura: as linhas como vieram do fornecedor, mais o consumo agregado.',
 				'PUT /api/v1/invoices/{id}' => 'Liga a fatura a um contador (meterId), ou desliga com meterId nulo.',
 				'DELETE /api/v1/invoices/{id}' => 'Apaga a fatura e as suas linhas.',
+				'GET /api/v1/meters/{id}/series' => 'A serie de consumo do contador, juntando leituras e faturas sem as somar (periodos sobrepostos contam uma vez, e ganha a leitura). Cada periodo traz "source" (reading|invoice), "days" e "totalPerDay". USA totalPerDay para comparar periodos: eles tem duracoes diferentes, e comparar totais de periodos desiguais le-se mal.',
 				'GET /api/v1/meters/{id}/forecast' => 'Projecta consumo e custo para os proximos "days" dias (por omissao 30). Usa leituras e faturas sem as somar -- periodos sobrepostos contam uma vez, e ganha a leitura. LE "confidence" e "caveats" ANTES de usar os numeros: com base insuficiente devolve "projected" nulo, e nesse caso nao ha numero nenhum a extrair daqui. O custo so vem se houver fatura importada deste contador.',
 				['method' => 'GET', 'path' => '/api/v1/overview', 'summary' => 'Tudo de uma vez: contadores com ultima leitura, garrafas em uso e medias'],
 				['method' => 'GET', 'path' => '/api/v1/meters', 'summary' => 'Listar contadores (?kind=electricity|water, ?includeArchived=true)'],
@@ -786,6 +787,34 @@ class ApiController extends OCSController {
 		} catch (DoesNotExistException) {
 			return $this->notFound();
 		}
+	}
+
+	/**
+	 * A serie de consumo do contador, juntando leituras e faturas.
+	 *
+	 * E o que alimenta tabelas e graficos. As duas fontes nao se somam:
+	 * periodos sobrepostos sao o mesmo consumo contado duas vezes, e ganha a
+	 * leitura. Cada periodo diz de onde veio, em `source`.
+	 *
+	 * Repara em `totalPerDay`: os periodos tem duracoes diferentes, e
+	 * comparar totais de periodos desiguais le-se mal -- a barra maior pode
+	 * ser so a mais comprida.
+	 */
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'GET', url: '/api/v1/meters/{id}/series')]
+	public function series(int $id): DataResponse {
+		$userId = $this->getUserId();
+
+		try {
+			$detail = $this->readingService->detail($id, $userId);
+		} catch (DoesNotExistException) {
+			return $this->notFound();
+		}
+
+		return new DataResponse($this->forecastService->unified(
+			$this->forecastService->fromSeries($detail['series']['periods'] ?? []),
+			$this->forecastService->fromInvoices($this->invoiceService->consumptionSeries($userId, $id))
+		) + ['unit' => $detail['meter']['unit'] ?? null]);
 	}
 
 	// --------------------------------------------------------------- Previsao
