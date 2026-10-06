@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace OCA\HomeExpenses\Controller;
 
 use OCA\HomeExpenses\Service\GasService;
+use OCA\HomeExpenses\Service\InvoiceImportException;
+use OCA\HomeExpenses\Service\InvoiceService;
 use OCA\HomeExpenses\Service\MeterService;
 use OCA\HomeExpenses\Service\ReadingService;
 use OCA\HomeExpenses\Service\TariffService;
@@ -39,6 +41,7 @@ class ApiController extends OCSController {
 		private ReadingService $readingService,
 		private GasService $gasService,
 		private TariffService $tariffService,
+		private InvoiceService $invoiceService,
 		private IUserSession $userSession,
 	) {
 		parent::__construct($appName, $request);
@@ -95,6 +98,9 @@ class ApiController extends OCSController {
 				'tareKg' => 'Peso da garrafa VAZIA, gravado na gola. Varia entre garrafas do mesmo tipo. Sem ele nao ha nivel nem dias restantes -- o calculo devolve null em vez de inventar.',
 				'weighing' => 'Peso TOTAL na balanca (garrafa + gas). O nivel deriva-se: (bruto - tara) / nominal.',
 				'derived' => 'Consumo, nivel, duracao e comparacao de tarifarios NUNCA sao guardados -- sao sempre calculados a partir dos valores em bruto.',
+				'invoice' => 'Um DOCUMENTO FISCAL lido do PDF da fatura, identificado pelo ATCUD. Um PDF traz mais do que um: numa fatura da EDP, a eletricidade e a Contribuicao Audiovisual sao documentos separados.',
+				'atcud' => 'Codigo unico de documento fiscal portugues. E a chave de idempotencia da importacao: reimportar o mesmo PDF devolve os documentos em "existing" em vez de duplicar.',
+				'invoiceVsReading' => 'Fontes COMPLEMENTARES, nao alternativas. A fatura so traz os escaloes que o contrato fatura: num contrato bi-horario traz V e FV, nunca C e P separados. So as leituras que tu fazes ao mostrador permitem responder a "o tri-horario sairia mais barato?". Importar faturas NAO substitui ler o contador.',
 			],
 			'tipTriVsBi' =>
 				'Em Portugal e normal ter um contador tri-horario (tres registos V/C/P) com um contrato '
@@ -103,6 +109,11 @@ class ApiController extends OCSController {
 				. 'e isso que permite ao endpoint /compare responder com exatidao se o tri-horario sairia mais '
 				. 'barato. Ao criar o contador, passa registerCodes=["V","C","P"] mesmo com tariffOption="bi".',
 			'quickReference' => [
+				'POST /api/v1/invoices/import' => 'Importa uma fatura em PDF. O ficheiro vai em multipart no campo "file", ou em base64 no corpo JSON em "content" (com "filename"). Opcional: "meterId". Devolve {created, existing, warnings}. LE SEMPRE os avisos: uma linha de energia que nao entre nos totais aparece la, e ignora-la deixa o total a menos com ar de certo.',
+				'GET /api/v1/invoices' => 'Faturas importadas, com o consumo por escalao ja somado (as linhas vem partidas por taxa de IVA na fatura; aqui ja estao juntas). Filtro opcional: meterId.',
+				'GET /api/v1/invoices/{id}' => 'Uma fatura: as linhas como vieram do fornecedor, mais o consumo agregado.',
+				'PUT /api/v1/invoices/{id}' => 'Liga a fatura a um contador (meterId), ou desliga com meterId nulo.',
+				'DELETE /api/v1/invoices/{id}' => 'Apaga a fatura e as suas linhas.',
 				['method' => 'GET', 'path' => '/api/v1/overview', 'summary' => 'Tudo de uma vez: contadores com ultima leitura, garrafas em uso e medias'],
 				['method' => 'GET', 'path' => '/api/v1/meters', 'summary' => 'Listar contadores (?kind=electricity|water, ?includeArchived=true)'],
 				['method' => 'POST', 'path' => '/api/v1/meters', 'summary' => 'Criar contador (name, kind, unit, tariffOption simples|bi|tri, registerCodes[], location, serial, digits, installedAt)'],
@@ -615,6 +626,105 @@ class ApiController extends OCSController {
 	public function deleteTariff(int $id): DataResponse {
 		try {
 			$this->tariffService->delete($id, $this->getUserId());
+			return new DataResponse([]);
+		} catch (DoesNotExistException) {
+			return $this->notFound();
+		}
+	}
+
+	// ---------------------------------------------------------------- Faturas
+
+	/**
+	 * Importa uma fatura em PDF.
+	 *
+	 * O PDF e lido por um servico externo que descodifica o QR fiscal ATCUD e
+	 * extrai as linhas; a chamada e feita do lado do servidor para que isto
+	 * seja um endpoint como os outros.
+	 *
+	 * Um PDF pode conter mais do que um documento fiscal -- numa fatura da EDP,
+	 * a eletricidade e a Contribuicao Audiovisual vem separadas -- por isso a
+	 * resposta e uma lista. O ATCUD torna a operacao idempotente: reimportar o
+	 * mesmo ficheiro devolve os documentos em `existing` e nao duplica nada.
+	 *
+	 * Envia-se o PDF como `multipart/form-data` no campo `file`, ou em base64
+	 * no corpo JSON em `content`. O segundo existe para um agente que nao
+	 * consiga montar um multipart.
+	 */
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'POST', url: '/api/v1/invoices/import')]
+	public function importInvoice(
+		?string $content = null,
+		?string $filename = null,
+		?int $meterId = null,
+	): DataResponse {
+		$uploaded = $this->request->getUploadedFile('file');
+
+		if (is_array($uploaded) && ($uploaded['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+			$bytes = (string)file_get_contents($uploaded['tmp_name']);
+			$name = (string)($uploaded['name'] ?? 'fatura.pdf');
+		} elseif ($content !== null && $content !== '') {
+			$bytes = base64_decode($content, true);
+			if ($bytes === false) {
+				return $this->badRequest('O campo "content" tem de ser base64 valido.');
+			}
+			$name = $filename ?? 'fatura.pdf';
+		} else {
+			return $this->badRequest(
+				'Falta o ficheiro: envia o PDF em multipart no campo "file", ou em base64 em "content".'
+			);
+		}
+
+		if ($bytes === '') {
+			return $this->badRequest('O ficheiro esta vazio.');
+		}
+
+		try {
+			$result = $this->invoiceService->import($this->getUserId(), $bytes, $name, $meterId);
+		} catch (InvoiceImportException $e) {
+			return $this->badRequest($e->getMessage());
+		}
+
+		return new DataResponse($result);
+	}
+
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'GET', url: '/api/v1/invoices')]
+	public function listInvoices(?int $meterId = null): DataResponse {
+		return new DataResponse($this->invoiceService->findAll($this->getUserId(), $meterId));
+	}
+
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'GET', url: '/api/v1/invoices/{id}')]
+	public function getInvoice(int $id): DataResponse {
+		try {
+			return new DataResponse($this->invoiceService->detail($id, $this->getUserId()));
+		} catch (DoesNotExistException) {
+			return $this->notFound();
+		}
+	}
+
+	/**
+	 * Liga uma fatura a um contador, ou desliga-a passando `meterId` nulo.
+	 *
+	 * Fica a parte da importacao porque nem todos os documentos de um PDF
+	 * pertencem a um contador: a Contribuicao Audiovisual nao pertence a
+	 * nenhum.
+	 */
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'PUT', url: '/api/v1/invoices/{id}')]
+	public function updateInvoice(int $id, ?int $meterId = null): DataResponse {
+		try {
+			return new DataResponse($this->invoiceService->assignMeter($id, $this->getUserId(), $meterId));
+		} catch (DoesNotExistException) {
+			return $this->notFound();
+		}
+	}
+
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'DELETE', url: '/api/v1/invoices/{id}')]
+	public function deleteInvoice(int $id): DataResponse {
+		try {
+			$this->invoiceService->delete($id, $this->getUserId());
 			return new DataResponse([]);
 		} catch (DoesNotExistException) {
 			return $this->notFound();
