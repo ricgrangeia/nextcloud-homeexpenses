@@ -5,6 +5,7 @@ import MetersView from '../views/MetersView.vue'
 import MeterView from '../views/MeterView.vue'
 import GasView from '../views/GasView.vue'
 import TariffsView from '../views/TariffsView.vue'
+import InvoicesView from '../views/InvoicesView.vue'
 
 export default createRouter({
 	history: createWebHashHistory(),
@@ -13,6 +14,7 @@ export default createRouter({
 		{ path: '/meters', name: 'meters', component: MetersView },
 		{ path: '/meters/:id', name: 'meter', component: MeterView, props: true },
 		{ path: '/gas', name: 'gas', component: GasView },
+		{ path: '/invoices', name: 'invoices', component: InvoicesView },
 		{ path: '/tariffs', name: 'tariffs', component: TariffsView },
 	],
 })

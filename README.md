@@ -104,6 +104,53 @@ curl $AUTH -X POST "$BASE/tariffs" -d '{
 curl $AUTH "$BASE/meters/1/compare"
 ```
 
+### Importar faturas
+
+A fatura é lida pelo seu **QR code fiscal ATCUD**, por um serviço externo
+(`qrcode.appa8.com`, configurável). Tem de ser o PDF original do fornecedor — não
+uma fotografia nem uma impressão.
+
+```bash
+curl -u 'utilizador:app-password' -H 'OCS-APIRequest: true' \
+  -F 'file=@fatura.pdf' -F 'meterId=1' \
+  "$BASE/invoices/import"
+```
+
+A resposta traz `{created, existing, warnings}`. **Lê sempre os avisos**: uma linha de
+energia que não entre nos totais aparece lá, e ignorá-la deixa o total a menos com ar de
+certo.
+
+Três coisas que uma fatura da EDP faz, e que moldam o que a app guarda:
+
+- **As linhas vêm partidas por taxa de IVA, não por registo.** "Consumo real Vazio"
+  aparece duas vezes — parte do consumo leva IVA reduzido. Quem tratar cada linha como um
+  registo fica com metade do consumo. A proporção 6%/23% **não é calculada por regra**: é
+  lida da fatura, porque a regra legal muda.
+- **Um período de faturação pode conter duas tarifas.** Numa mudança de tarifário a meio
+  do mês, a mesma fatura traz "Simples" de um intervalo e "Vazio"/"Fora vazio" de outro.
+- **Um PDF traz vários documentos fiscais.** A eletricidade e a Contribuição Audiovisual
+  são faturas separadas. O ATCUD distingue-as, e torna a importação idempotente.
+
+> **Importar faturas não substitui ler o contador.** A fatura só traz os escalões que o
+> contrato fatura: num contrato bi-horário traz `V` e `FV`, nunca `C` e `P` separados. As
+> duas fontes são complementares — as leituras respondem a *"o tri-horário compensava?"*,
+> a fatura diz quanto custam a potência, as redes e os impostos.
+
+### Previsão
+
+```bash
+curl $AUTH "$BASE/meters/1/forecast?days=30"
+```
+
+Projeta consumo e, havendo fatura de onde derivar o modelo de custo, também o valor a
+pagar. Usa as duas fontes **sem as somar**: períodos sobrepostos são o mesmo consumo
+contado duas vezes, e ganha a leitura.
+
+Lê `confidence` e `caveats` antes dos números. Com menos de dois períodos devolve
+`projected` a `null` em vez de um valor — um número errado com duas casas decimais é pior
+do que a ausência dele, porque parece credível. E enquanto não houver um ano de histórico,
+a resposta diz que a sazonalidade não está contabilizada, e em que direção o erro vai.
+
 ### Garrafas de gás
 
 ```bash

@@ -131,6 +131,71 @@
 					</table>
 				</template>
 			</template>
+
+			<h3>Quanto deve gastar daqui para a frente</h3>
+			<div class="he-form">
+				<NcSelect v-model="horizon" :options="horizons" :reduce="(o) => o.value"
+					label="label" input-label="Período" :clearable="false" />
+				<NcButton :disabled="forecasting" @click="runForecast">Projetar</NcButton>
+			</div>
+
+			<template v-if="forecast">
+				<div v-for="(caveat, i) in forecast.caveats" :key="i" class="he-warn">{{ caveat }}</div>
+
+				<p v-if="!forecast.projected" class="he-empty">
+					Sem base que chegue para projetar. Lança mais leituras, ou importa uma fatura.
+				</p>
+
+				<template v-else>
+					<p class="he-hint">
+						Baseado em {{ forecast.basis.daysObserved }} dias
+						({{ forecast.basis.periods }} períodos,
+						{{ forecast.sources.readings }} de leituras e
+						{{ forecast.sources.invoices }} de faturas<template
+							v-if="forecast.sources.discarded">; {{ forecast.sources.discarded }}
+							período(s) de fatura ignorado(s) por se sobreporem a leituras</template>).
+						Confiança: <strong>{{ confidenceLabel }}</strong>.
+					</p>
+
+					<div class="he-grid">
+						<div v-for="(kwh, code) in forecast.projected.byRegister" :key="code" class="he-stat">
+							<span class="he-stat-label">{{ REGISTER_LABELS[code] || code }}</span>
+							<span class="he-stat-value">{{ formatNumber(kwh) }}</span>
+							<span class="he-stat-label">kWh em {{ forecast.projected.days }} dias</span>
+						</div>
+						<div class="he-stat">
+							<span class="he-stat-label">Total</span>
+							<span class="he-stat-value">{{ formatNumber(forecast.projected.total) }}</span>
+							<span class="he-stat-label">
+								{{ formatNumber(forecast.perDay.total, 2) }} kWh / dia
+							</span>
+						</div>
+					</div>
+
+					<template v-if="forecast.cost">
+						<h3>E quanto deve custar</h3>
+						<div v-if="!forecast.cost.complete" class="he-warn">
+							Sem preço para {{ forecast.cost.unpriced.join(', ') }}. O total está a menos —
+							não é zero, é desconhecido.
+						</div>
+						<table class="he-table">
+							<tbody>
+								<tr><td>Energia</td><td class="he-num">{{ formatMoney(forecast.cost.energy) }}</td></tr>
+								<tr><td>Potência e acesso às redes</td><td class="he-num">{{ formatMoney(forecast.cost.fixed) }}</td></tr>
+								<tr><td>IEC, DGEG e audiovisual</td><td class="he-num">{{ formatMoney(forecast.cost.levies) }}</td></tr>
+								<tr><td>IVA</td><td class="he-num">{{ formatMoney(forecast.cost.vat) }}</td></tr>
+								<tr><td><strong>Total</strong></td><td class="he-num"><strong>{{ formatMoney(forecast.cost.gross) }}</strong></td></tr>
+							</tbody>
+						</table>
+						<p v-if="forecast.costModelFrom" class="he-hint">
+							Preços da fatura {{ forecast.costModelFrom.docNumber }},
+							de {{ formatDate(forecast.costModelFrom.periodFrom) }}
+							a {{ formatDate(forecast.costModelFrom.periodTo) }}.
+						</p>
+					</template>
+				</template>
+			</template>
+
 		</template>
 	</div>
 </template>
@@ -141,11 +206,12 @@ import NcButton from '@nextcloud/vue/components/NcButton'
 import NcTextField from '@nextcloud/vue/components/NcTextField'
 import NcLoadingIcon from '@nextcloud/vue/components/NcLoadingIcon'
 import NcCheckboxRadioSwitch from '@nextcloud/vue/components/NcCheckboxRadioSwitch'
+import NcSelect from '@nextcloud/vue/components/NcSelect'
 import NcDateTimePickerNative from '@nextcloud/vue/components/NcDateTimePickerNative'
 import { showError, showSuccess } from '@nextcloud/dialogs'
 
 import api from '../api/client.js'
-import { formatDate, formatNumber, formatMoney } from '../utils/format.js'
+import { formatDate, formatNumber, formatMoney, REGISTER_LABELS } from '../utils/format.js'
 
 const props = defineProps({ id: { type: [String, Number], required: true } })
 
@@ -154,6 +220,24 @@ const saving = ref(false)
 const comparing = ref(false)
 const detail = ref(null)
 const comparison = ref(null)
+const forecast = ref(null)
+const forecasting = ref(false)
+const horizon = ref(30)
+
+const horizons = [
+	{ value: 30, label: 'Próximos 30 dias' },
+	{ value: 90, label: 'Próximos 3 meses' },
+	{ value: 365, label: 'Próximo ano' },
+]
+
+const CONFIDENCE = {
+	none: 'nenhuma',
+	low: 'baixa',
+	medium: 'média',
+	high: 'alta',
+}
+
+const confidenceLabel = computed(() => CONFIDENCE[forecast.value?.confidence] ?? '—')
 
 const form = reactive({ readAt: new Date(), values: {}, isEstimate: false })
 
@@ -199,6 +283,7 @@ const addReading = async () => {
 		form.values = {}
 		showSuccess('Leitura lançada.')
 		comparison.value = null
+		forecast.value = null
 		await load()
 	} catch (error) {
 		showError(error?.response?.data?.ocs?.data?.message ?? 'Não foi possível lançar a leitura.')
@@ -214,9 +299,21 @@ const removeReading = async (reading) => {
 	try {
 		await api.deleteReading(reading.id)
 		comparison.value = null
+		forecast.value = null
 		await load()
 	} catch (error) {
 		showError('Não foi possível apagar a leitura.')
+	}
+}
+
+const runForecast = async () => {
+	forecasting.value = true
+	try {
+		forecast.value = await api.forecast(props.id, horizon.value)
+	} catch (error) {
+		showError('Não foi possível calcular a previsão.')
+	} finally {
+		forecasting.value = false
 	}
 }
 

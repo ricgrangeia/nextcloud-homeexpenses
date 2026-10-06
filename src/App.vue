@@ -11,6 +11,9 @@
 				<NcAppNavigationItem :to="{ name: 'gas' }" name="Garrafas de gás">
 					<template #icon><FireIcon :size="20" /></template>
 				</NcAppNavigationItem>
+				<NcAppNavigationItem :to="{ name: 'invoices' }" name="Faturas">
+					<template #icon><FileDocumentIcon :size="20" /></template>
+				</NcAppNavigationItem>
 				<NcAppNavigationItem :to="{ name: 'tariffs' }" name="Tarifários">
 					<template #icon><CurrencyEurIcon :size="20" /></template>
 				</NcAppNavigationItem>
@@ -33,6 +36,7 @@ import HomeIcon from 'vue-material-design-icons/Home.vue'
 import GaugeIcon from 'vue-material-design-icons/Gauge.vue'
 import FireIcon from 'vue-material-design-icons/Fire.vue'
 import CurrencyEurIcon from 'vue-material-design-icons/CurrencyEur.vue'
+import FileDocumentIcon from 'vue-material-design-icons/FileDocument.vue'
 </script>
 
 <style>
