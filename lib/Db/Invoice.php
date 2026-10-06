@@ -42,6 +42,10 @@ use OCP\DB\Types;
  * @method void setTotalGross(?float $totalGross)
  * @method bool getVerified()
  * @method void setVerified(bool $verified)
+ * @method ?\DateTimeImmutable getDueDate()
+ * @method void setDueDate(?\DateTimeImmutable $dueDate)
+ * @method ?string getPaymentReference()
+ * @method void setPaymentReference(?string $paymentReference)
  * @method ?string getSourceName()
  * @method void setSourceName(?string $sourceName)
  */
@@ -60,6 +64,8 @@ class Invoice extends Entity implements \JsonSerializable {
 	protected ?float $totalVat = null;
 	protected ?float $totalGross = null;
 	protected bool $verified = false;
+	protected ?\DateTimeImmutable $dueDate = null;
+	protected ?string $paymentReference = null;
 	protected ?string $sourceName = null;
 	protected ?\DateTimeImmutable $createdAt = null;
 
@@ -71,6 +77,7 @@ class Invoice extends Entity implements \JsonSerializable {
 		$this->addType('totalNet', Types::FLOAT);
 		$this->addType('totalVat', Types::FLOAT);
 		$this->addType('totalGross', Types::FLOAT);
+		$this->addType('dueDate', Types::DATE_IMMUTABLE);
 		$this->addType('verified', Types::BOOLEAN);
 		$this->addType('createdAt', Types::DATETIME_IMMUTABLE);
 	}
@@ -90,6 +97,8 @@ class Invoice extends Entity implements \JsonSerializable {
 			'totalNet' => $this->totalNet,
 			'totalVat' => $this->totalVat,
 			'totalGross' => $this->totalGross,
+			'dueDate' => $this->dueDate?->format('Y-m-d'),
+			'paymentReference' => $this->paymentReference,
 			'verified' => $this->verified,
 			'sourceName' => $this->sourceName,
 		];

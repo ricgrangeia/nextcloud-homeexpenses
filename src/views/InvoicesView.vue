@@ -4,7 +4,9 @@
 		<p class="he-hint">
 			O PDF original do fornecedor, não uma fotografia nem uma impressão — é o QR code fiscal
 			que é lido. Dele saem os preços por escalão, a potência, o acesso às redes e os impostos,
-			que é o que falta para saber quanto vai custar o mês seguinte.
+			que é o que falta para saber quanto vai custar o mês seguinte. As linhas extraídas são
+			conferidas contra o total declarado no QR: se não fecharem, a fatura fica marcada e
+			não entra em contas.
 		</p>
 
 		<div class="he-warn">
@@ -53,8 +55,8 @@
 			</div>
 
 			<div v-if="!invoice.verified" class="he-warn">
-				As contas deste documento não fecham com o que o QR fiscal declara. Fica guardado,
-				mas não entra em cálculos nem em previsões.
+				As contas deste documento não fecham com o que o QR fiscal declara — ou o total, ou o
+				IVA, ou a soma das linhas. Fica guardado, mas não entra em cálculos nem em previsões.
 			</div>
 
 			<div class="he-grid">
@@ -72,6 +74,13 @@
 				<div class="he-stat">
 					<span class="he-stat-label">Consumo</span>
 					<span class="he-stat-value">{{ formatNumber(totalKwh(invoice)) }} kWh</span>
+				</div>
+				<div v-if="invoice.dueDate" class="he-stat">
+					<span class="he-stat-label">Pagar até</span>
+					<span class="he-stat-value" style="font-size:15px">{{ formatDate(invoice.dueDate) }}</span>
+					<span v-if="invoice.paymentReference" class="he-stat-label">
+						ref. {{ invoice.paymentReference }}
+					</span>
 				</div>
 			</div>
 

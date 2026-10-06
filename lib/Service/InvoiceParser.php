@@ -7,6 +7,12 @@ namespace OCA\HomeExpenses\Service;
 /**
  * Transforma a resposta do servico de leitura de faturas em linhas classificadas.
  *
+ * Consome o **esquema v1** de /api/v1/document/extract?linhas=true. Nesse
+ * esquema cada documento traz as suas proprias linhas (nao ha que as cruzar
+ * por ATCUD), e traz uma conferencia das linhas contra o total declarado no
+ * QR fiscal -- `lines_match` com `lines_sum`. Isso e o que permite nao ter de
+ * confiar na extracao: ela diz se fecha.
+ *
  * Nao tem dependencias e nao toca na base de dados: recebe o array devolvido
  * por /api/v1/document/full e devolve estrutura. E assim porque esta e a parte
  * que mais facilmente erra em silencio -- um "Vazio" lido como "Fora vazio" mete
@@ -72,42 +78,56 @@ class InvoiceParser {
 		$documents = [];
 		$warnings = [];
 
-		$rowsByAtcud = [];
-		foreach ($full['items']['rows'] ?? [] as $row) {
-			$rowsByAtcud[(string)($row['atcud'] ?? '')][] = $row;
+		// Avisos do proprio servico de extracao, ao nivel do ficheiro.
+		foreach ($full['file']['warnings'] ?? [] as $warning) {
+			$warnings[] = (string)$warning;
 		}
 
-		foreach ($full['invoice']['documents'] ?? [] as $doc) {
-			$atcud = (string)($doc['document']['atcud'] ?? '');
+		foreach ($full['documents'] ?? [] as $doc) {
+			$header = $doc['document'] ?? [];
+			$verification = $doc['verification'] ?? [];
+
 			$lines = [];
-			foreach ($rowsByAtcud[$atcud] ?? [] as $row) {
+			foreach ($doc['lines'] ?? [] as $row) {
 				$lines[] = $this->classify($row);
 			}
 
-			// Um documento fiscal cujo total nao fecha nao e para usar em
-			// calculos. Guarda-se na mesma -- apagar o que nao se entende e
-			// pior do que guardar com uma marca -- mas fica assinalado.
-			$verified = ($doc['verification']['matches'] ?? false) === true
-				&& ($doc['verification']['taxes_match'] ?? false) === true;
+			// Tres conferencias, e e preciso que as tres fechem. A terceira --
+			// `lines_match` -- e a que importa aqui: diz que a soma das linhas
+			// extraidas bate com o total que o QR fiscal declara. Sem ela, as
+			// linhas podiam estar incompletas sem nada o denunciar.
+			$verified = ($verification['totals_match'] ?? false) === true
+				&& ($verification['taxes_match'] ?? false) === true
+				&& ($verification['lines_match'] ?? false) === true;
+
 			if (!$verified) {
 				$warnings[] = sprintf(
-					'O documento %s nao fecha nas contas e nao sera usado em calculos.',
-					$doc['document']['number'] ?? $atcud
+					'O documento %s nao fecha nas contas (%s) e nao sera usado em calculos.',
+					$header['number'] ?? ($header['atcud'] ?? '?'),
+					$this->whyNot($verification)
 				);
 			}
 
+			foreach ($doc['warnings'] ?? [] as $warning) {
+				$warnings[] = (string)$warning;
+			}
+
 			$documents[] = [
-				'atcud' => $atcud,
-				'supplier' => (string)($doc['seller']['descricao'] ?? ''),
-				'docType' => (string)($doc['document']['type'] ?? ''),
-				'docNumber' => (string)($doc['document']['number'] ?? ''),
-				'issuedAt' => (string)($doc['document']['date'] ?? ''),
-				'totalNet' => $this->float($doc['totals']['base'] ?? null),
-				'totalVat' => $this->float($doc['taxes']['tax_total'] ?? null),
+				'atcud' => (string)($header['atcud'] ?? ''),
+				'supplier' => (string)($header['seller']['name'] ?? ''),
+				'docType' => (string)($header['type'] ?? ''),
+				'docNumber' => (string)($header['number'] ?? ''),
+				'issuedAt' => (string)($header['date'] ?? ''),
+				'totalNet' => $this->float($doc['totals']['taxable'] ?? null),
+				'totalVat' => $this->float($doc['totals']['tax_total'] ?? null),
 				'totalGross' => $this->float($doc['totals']['gross'] ?? null),
 				'verified' => $verified,
 				'periodFrom' => $this->earliest($lines),
 				'periodTo' => $this->latest($lines),
+				// A referencia e a data-limite sao do ficheiro, nao do
+				// documento: um PDF com duas faturas tem um so pagamento.
+				'dueDate' => (string)($full['file']['payment']['due_date'] ?? ''),
+				'paymentReference' => (string)($full['file']['payment']['reference'] ?? ''),
 				'lines' => $lines,
 				'consumption' => $this->aggregate($lines),
 			];
@@ -139,6 +159,23 @@ class InvoiceParser {
 		}
 
 		return ['documents' => $documents, 'warnings' => $warnings];
+	}
+
+	/**
+	 * Diz qual das conferencias falhou, para o aviso nao ser so "nao fecha".
+	 */
+	private function whyNot(array $verification): string {
+		$failed = [];
+		if (($verification['totals_match'] ?? false) !== true) {
+			$failed[] = 'o total nao bate com o QR';
+		}
+		if (($verification['taxes_match'] ?? false) !== true) {
+			$failed[] = 'o IVA nao bate';
+		}
+		if (($verification['lines_match'] ?? false) !== true) {
+			$failed[] = 'a soma das linhas nao bate com o total';
+		}
+		return $failed === [] ? 'razao desconhecida' : implode(', ', $failed);
 	}
 
 	/**
@@ -180,11 +217,12 @@ class InvoiceParser {
 			'periodFrom' => $from,
 			'periodTo' => $to,
 			'quantity' => $this->float($row['quantity'] ?? null),
+			'unit' => isset($row['unit']) ? (string)$row['unit'] : null,
 			'unitPrice' => $this->float($row['unit_price'] ?? null),
 			'discount' => $this->float($row['discount'] ?? null),
-			'vatRate' => $this->float($row['vat_rate'] ?? null),
-			'totalNet' => $this->float($row['total_excl_vat'] ?? null),
-			'page' => (int)($row['page'] ?? 0),
+			'vatRate' => $this->vatPercent($row['vat_rate'] ?? null),
+			'totalNet' => $this->float($row['net'] ?? null),
+			'page' => (int)($row['raw']['page'] ?? $row['page'] ?? 0),
 		];
 	}
 
@@ -319,6 +357,27 @@ class InvoiceParser {
 			'ó' => 'o', 'ô' => 'o', 'õ' => 'o',
 			'ú' => 'u', 'ç' => 'c',
 		]);
+	}
+
+	/**
+	 * Normaliza a taxa de IVA para percentagem.
+	 *
+	 * O esquema v1 do extractor da a taxa em fraccao (0.06, 0.23); outras
+	 * respostas dao-na em percentagem (6, 23). Guarda-se sempre em
+	 * percentagem, que e como se le numa fatura -- e, mais importante, para
+	 * nao haver codigo a jusante a ter de adivinhar qual das duas recebeu.
+	 * Um modelo de custo que tome 0.23 por 23 trata tudo como taxa reduzida e
+	 * subestima o IVA em dois tercos, sem nada falhar.
+	 *
+	 * Nenhuma taxa portuguesa cai entre 1% e 100%, por isso um valor <= 1
+	 * (diferente de zero) so pode ser fraccao.
+	 */
+	private function vatPercent(mixed $value): ?float {
+		$rate = $this->float($value);
+		if ($rate === null) {
+			return null;
+		}
+		return $rate > 0.0 && $rate <= 1.0 ? round($rate * 100, 2) : $rate;
 	}
 
 	private function float(mixed $value): ?float {

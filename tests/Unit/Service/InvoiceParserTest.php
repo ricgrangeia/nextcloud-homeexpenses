@@ -19,34 +19,53 @@ class InvoiceParserTest extends TestCase {
 		$this->parser = new InvoiceParser();
 	}
 
-	private function payload(array $rows, array $overrides = []): array {
-		$doc = array_merge([
-			'page_number' => 2,
-			'seller' => ['descricao' => 'EDP COMERCIAL'],
+	/**
+	 * Monta uma resposta no esquema v1 de /api/v1/document/extract?linhas=true.
+	 */
+	private function payload(array $lines, array $overrides = []): array {
+		$doc = array_replace_recursive([
+			'source' => ['kind' => 'qr', 'page' => 2],
 			'document' => [
-				'type' => 'FT', 'date' => '2026-10-02',
+				'type' => 'FT', 'type_label' => 'Fatura', 'date' => '2026-10-02',
 				'number' => 'FT2026 X/1', 'atcud' => 'AAAA-1',
+				'seller' => ['nif' => '503504564', 'name' => 'EDP COMERCIAL'],
 			],
-			'taxes' => ['tax_total' => 10.0],
-			'totals' => ['base' => 50.0, 'gross' => 60.0],
-			'verification' => ['matches' => true, 'taxes_match' => true],
+			'taxes' => [['region' => 'PT', 'rate' => 'normal', 'base' => 50.0, 'vat' => 10.0]],
+			'totals' => ['taxable' => 50.0, 'tax_total' => 10.0, 'gross' => 60.0],
+			'verification' => ['totals_match' => true, 'taxes_match' => true, 'lines_match' => true],
+			'warnings' => [],
+			'lines' => $lines,
 		], $overrides);
 
-		foreach ($rows as &$row) {
-			$row['atcud'] ??= $doc['document']['atcud'];
-		}
-
 		return [
-			'invoice' => ['documents' => [$doc]],
-			'items' => ['rows' => $rows],
+			'schema_version' => '1.0',
+			'file' => [
+				'pages' => 4,
+				'documents_found' => 1,
+				'payment' => ['reference' => '223151852', 'amount' => 60.0, 'due_date' => '2026-10-26'],
+				'totals' => ['gross' => 60.0],
+				'verification' => ['payment_matches_documents' => true],
+				'warnings' => [],
+			],
+			'documents' => [$doc],
 		];
 	}
 
-	private function line(string $description, float $qty, float $price, int $vat): array {
+	/**
+	 * Uma linha no esquema v1. Nota o `vat_rate` em FRACCAO -- e assim que o
+	 * extractor a da, e e a diferenca que mais facilmente passaria despercebida.
+	 */
+	private function line(string $description, float $qty, float $price, float $vatPercent): array {
 		return [
-			'description' => $description, 'quantity' => $qty,
-			'unit_price' => $price, 'vat_rate' => $vat,
-			'total_excl_vat' => round($qty * $price, 2), 'page' => 2,
+			'line_number' => 1,
+			'description' => $description,
+			'quantity' => $qty,
+			'unit' => null,
+			'unit_price' => $price,
+			'discount' => 0.0,
+			'vat_rate' => $vatPercent / 100,
+			'net' => round($qty * $price, 2),
+			'raw' => ['page' => 2],
 		];
 	}
 
@@ -212,11 +231,12 @@ class InvoiceParserTest extends TestCase {
 	public function testDocumentoQueNaoFechaFicaMarcado(): void {
 		$result = $this->parser->parse($this->payload(
 			[$this->line('Consumo real Vazio 1 out a 31 out 2026', 10, 0.1, 23)],
-			['verification' => ['matches' => false, 'taxes_match' => true]]
+			['verification' => ['totals_match' => false, 'taxes_match' => true, 'lines_match' => true]]
 		));
 
 		$this->assertFalse($result['documents'][0]['verified']);
 		$this->assertStringContainsString('nao fecha', $result['warnings'][0]);
+		$this->assertStringContainsString('nao bate com o QR', $result['warnings'][0]);
 	}
 
 	/**
@@ -225,37 +245,75 @@ class InvoiceParserTest extends TestCase {
 	 * distinguem-se pelo ATCUD.
 	 */
 	public function testVariosDocumentosFiscaisNoMesmoPdf(): void {
-		$payload = [
-			'invoice' => ['documents' => [
-				[
-					'seller' => ['descricao' => 'EDP COMERCIAL'],
-					'document' => ['type' => 'FT', 'date' => '2026-10-02',
-						'number' => 'FT/1', 'atcud' => 'AAAA-1'],
-					'taxes' => ['tax_total' => 12.66],
-					'totals' => ['base' => 84.19, 'gross' => 96.85],
-					'verification' => ['matches' => true, 'taxes_match' => true],
-				],
-				[
-					'seller' => ['descricao' => 'EDP COMERCIAL'],
-					'document' => ['type' => 'FT', 'date' => '2026-10-02',
-						'number' => 'FT/2', 'atcud' => 'BBBB-2'],
-					'taxes' => ['tax_total' => 0.17],
-					'totals' => ['base' => 2.85, 'gross' => 3.02],
-					'verification' => ['matches' => true, 'taxes_match' => true],
-				],
-			]],
-			'items' => ['rows' => [
-				['atcud' => 'AAAA-1'] + $this->line('Consumo real Vazio 1 out a 31 out 2026', 43, 0.1119, 23),
-				['atcud' => 'BBBB-2'] + $this->line('Contribuição Audiovisual 1 mês', 1, 2.85, 6),
-			]],
+		$base = $this->payload([]);
+		$base['file']['documents_found'] = 2;
+		$base['documents'] = [
+			array_replace_recursive($base['documents'][0], [
+				'document' => ['number' => 'FT/1', 'atcud' => 'AAAA-1'],
+				'totals' => ['taxable' => 84.19, 'tax_total' => 12.66, 'gross' => 96.85],
+				'lines' => [$this->line('Consumo real Vazio 1 out a 31 out 2026', 43, 0.1119, 23)],
+			]),
+			array_replace_recursive($base['documents'][0], [
+				'document' => ['number' => 'FT/2', 'atcud' => 'BBBB-2'],
+				'totals' => ['taxable' => 2.85, 'tax_total' => 0.17, 'gross' => 3.02],
+				'lines' => [$this->line('Contribuição Audiovisual 1 mês', 1, 2.85, 6)],
+			]),
 		];
 
-		$result = $this->parser->parse($payload);
+		$result = $this->parser->parse($base);
 
 		$this->assertCount(2, $result['documents']);
 		$this->assertCount(1, $result['documents'][0]['consumption']);
 		$this->assertSame(96.85, $result['documents'][0]['totalGross']);
 		$this->assertSame([], $result['documents'][1]['consumption']);
 		$this->assertSame(3.02, $result['documents'][1]['totalGross']);
+	}
+
+	/**
+	 * O extractor da a taxa de IVA em fraccao (0.06). Guardada assim, um
+	 * modelo de custo que teste "< 10 e taxa reduzida" trata 0.23 como
+	 * reduzida e subestima o IVA em dois tercos -- sem nada falhar.
+	 */
+	public function testTaxaDeIvaEGuardadaEmPercentagem(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->line('Consumo real Vazio 1 out a 31 out 2026', 20, 0.1, 6),
+			$this->line('Consumo real Cheias 1 out a 31 out 2026', 30, 0.1, 23),
+		]));
+
+		$rates = array_column($result['documents'][0]['lines'], 'vatRate');
+		$this->assertSame([6.0, 23.0], $rates);
+	}
+
+	/**
+	 * `lines_match` diz que a soma das linhas extraidas bate com o total que
+	 * o QR fiscal declara. Sem ela, linhas em falta nao teriam quem as
+	 * denunciasse.
+	 */
+	public function testLinhasQueNaoSomamAoTotalDoQrMarcamODocumento(): void {
+		$result = $this->parser->parse($this->payload(
+			[$this->line('Consumo real Vazio 1 out a 31 out 2026', 10, 0.1, 23)],
+			['verification' => ['totals_match' => true, 'taxes_match' => true, 'lines_match' => false]]
+		));
+
+		$this->assertFalse($result['documents'][0]['verified']);
+		$this->assertStringContainsString('soma das linhas', $result['warnings'][0]);
+	}
+
+	public function testGuardaReferenciaEDataLimiteDoPagamento(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->line('Consumo real Vazio 1 out a 31 out 2026', 10, 0.1, 23),
+		]));
+
+		$this->assertSame('2026-10-26', $result['documents'][0]['dueDate']);
+		$this->assertSame('223151852', $result['documents'][0]['paymentReference']);
+	}
+
+	public function testPropagaAvisosDoProprioExtractor(): void {
+		$payload = $this->payload([$this->line('Consumo real Vazio 1 out a 31 out 2026', 10, 0.1, 23)]);
+		$payload['file']['warnings'] = ['A pagina 3 nao pode ser renderizada.'];
+
+		$result = $this->parser->parse($payload);
+
+		$this->assertContains('A pagina 3 nao pode ser renderizada.', $result['warnings']);
 	}
 }

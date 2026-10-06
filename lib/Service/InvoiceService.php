@@ -109,6 +109,10 @@ class InvoiceService {
 		$invoice->setTotalNet($doc['totalNet']);
 		$invoice->setTotalVat($doc['totalVat']);
 		$invoice->setTotalGross($doc['totalGross']);
+		$invoice->setDueDate($this->date($doc['dueDate'] ?? null));
+		$invoice->setPaymentReference(
+			($doc['paymentReference'] ?? '') !== '' ? mb_substr($doc['paymentReference'], 0, 64) : null
+		);
 		$invoice->setVerified($doc['verified']);
 		$invoice->setSourceName(mb_substr($filename, 0, 255));
 		$invoice->setCreatedAt(new \DateTimeImmutable());
@@ -322,7 +326,7 @@ class InvoiceService {
 	 * @throws InvoiceImportException
 	 */
 	private function read(string $contents, string $filename): array {
-		$url = $this->readerUrl() . '/api/v1/document/full';
+		$url = $this->readerUrl() . '/api/v1/document/extract?linhas=true';
 
 		try {
 			$response = $this->clientService->newClient()->post($url, [
@@ -343,7 +347,7 @@ class InvoiceService {
 		}
 
 		$decoded = json_decode((string)$response->getBody(), true);
-		if (!is_array($decoded) || !isset($decoded['invoice'])) {
+		if (!is_array($decoded) || !isset($decoded['documents'])) {
 			throw new InvoiceImportException('O servico de leitura devolveu uma resposta que nao se percebeu.');
 		}
 

@@ -107,8 +107,14 @@ curl $AUTH "$BASE/meters/1/compare"
 ### Importar faturas
 
 A fatura é lida pelo seu **QR code fiscal ATCUD**, por um serviço externo
-(`qrcode.appa8.com`, configurável). Tem de ser o PDF original do fornecedor — não
-uma fotografia nem uma impressão.
+(`qrcode.appa8.com`, configurável), através de `POST /api/v1/document/extract?linhas=true`.
+Tem de ser o PDF original do fornecedor — não uma fotografia nem uma impressão.
+
+Esse endpoint devolve o esquema v1, e a razão de ser ele e não outro é a conferência que
+traz: `lines_match` diz se a **soma das linhas extraídas bate com o total declarado no QR
+fiscal**. Numa fatura real, a extração sem essa conferência somava 91,04 € contra os
+84,19 € do QR — 6,85 € a mais, por contar um desdobramento como encargo. Com a
+conferência, uma fatura que não feche fica marcada e não entra em contas.
 
 ```bash
 curl -u 'utilizador:app-password' -H 'OCS-APIRequest: true' \
@@ -130,6 +136,9 @@ Três coisas que uma fatura da EDP faz, e que moldam o que a app guarda:
   do mês, a mesma fatura traz "Simples" de um intervalo e "Vazio"/"Fora vazio" de outro.
 - **Um PDF traz vários documentos fiscais.** A eletricidade e a Contribuição Audiovisual
   são faturas separadas. O ATCUD distingue-as, e torna a importação idempotente.
+- **A taxa de IVA vem em fração** (`0.06`), e é guardada em percentagem (`6`). Um modelo
+  de custo que tome `0.23` por `23` trata tudo como taxa reduzida e subestima o IVA em
+  dois terços, sem nada falhar.
 
 > **Importar faturas não substitui ler o contador.** A fatura só traz os escalões que o
 > contrato fatura: num contrato bi-horário traz `V` e `FV`, nunca `C` e `P` separados. As
