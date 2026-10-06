@@ -84,6 +84,15 @@ class ImportQueue {
 			return;
 		}
 
+		// O servico de leitura so processa alguns PDF ao mesmo tempo. Se nao
+		// houver lugar, adia-se para a proxima passagem do cron em vez de
+		// segurar uma ligacao a espera atras dos outros. Nao conta como
+		// tentativa: nao falhou nada, so nao era a vez.
+		if (!$this->invoices->readerHasRoom()) {
+			$this->jobList->add(ProcessImportJob::class, ['jobId' => $jobId]);
+			return;
+		}
+
 		$job->setStatus(ImportJob::RUNNING);
 		$job->setAttempts($job->getAttempts() + 1);
 		$this->jobs->update($job);

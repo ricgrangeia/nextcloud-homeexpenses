@@ -34,6 +34,20 @@ class InvoiceService {
 	private const DEFAULT_ENDPOINT = 'https://qrcode.appa8.com';
 	private const CONFIG_KEY = 'invoice_reader_url';
 
+	/**
+	 * Dez minutos.
+	 *
+	 * Nao e exagero: medido, um PDF de 4 paginas leva 163 segundos, e um de 8
+	 * chega aos 6 minutos. O servico renderiza cada pagina e procura QR codes
+	 * nela, por isso o tempo cresce com as paginas e nao com o tamanho do
+	 * ficheiro. O valor anterior -- 180 segundos -- dava 17 segundos de
+	 * margem numa fatura normal e rebentava em qualquer coisa maior.
+	 *
+	 * Esperar tanto so e aceitavel por isto correr num trabalho de fundo.
+	 */
+	private const DEFAULT_TIMEOUT = 600;
+	private const CONFIG_TIMEOUT = 'invoice_reader_timeout';
+
 	public function __construct(
 		private InvoiceMapper $invoices,
 		private InvoiceLineMapper $lines,
@@ -43,6 +57,59 @@ class InvoiceService {
 		private IDBConnection $db,
 		private LoggerInterface $logger,
 	) {
+	}
+
+	public function readerTimeout(): int {
+		return max(30, $this->appConfig->getValueInt(
+			Application::APP_ID, self::CONFIG_TIMEOUT, self::DEFAULT_TIMEOUT
+		));
+	}
+
+	/**
+	 * Estado da fila do servico de leitura.
+	 *
+	 * Ele processa no maximo `lugares` PDF ao mesmo tempo e poe os restantes
+	 * a espera. Saber isto antes de submeter evita segurar uma ligacao
+	 * durante a fila dos outros: mais vale adiar para a proxima passagem do
+	 * cron, que nao custa nada, do que ficar dez minutos a nao receber nada.
+	 *
+	 * @return array{em_curso: int, a_aguardar: int, lugares: int, max_espera: int}|null
+	 *         null quando nao se consegue saber -- nesse caso segue-se em frente,
+	 *         porque recusar por nao saber seria pior do que tentar.
+	 */
+	public function readerQueue(): ?array {
+		try {
+			$response = $this->clientService->newClient()->get($this->readerUrl() . '/api/v1/queue', [
+				'connect_timeout' => 10,
+				'timeout' => 15,
+			]);
+			$state = json_decode((string)$response->getBody(), true);
+		} catch (\Throwable) {
+			return null;
+		}
+
+		if (!is_array($state) || !isset($state['lugares'])) {
+			return null;
+		}
+
+		return [
+			'em_curso' => (int)($state['em_curso'] ?? 0),
+			'a_aguardar' => (int)($state['a_aguardar'] ?? 0),
+			'lugares' => (int)$state['lugares'],
+			'max_espera' => (int)($state['max_espera'] ?? 0),
+		];
+	}
+
+	/**
+	 * Ha lugar para comecar agora, ou vale a pena esperar pela proxima
+	 * passagem do cron?
+	 */
+	public function readerHasRoom(): bool {
+		$state = $this->readerQueue();
+		if ($state === null) {
+			return true;
+		}
+		return $state['em_curso'] < $state['lugares'];
 	}
 
 	public function readerUrl(): string {
@@ -352,14 +419,28 @@ class InvoiceService {
 					'contents' => $contents,
 					'filename' => $filename,
 				]],
-				// A leitura renderiza as paginas e procura QR codes; num PDF
-				// de varias paginas leva o seu tempo.
-				'timeout' => 180,
+				// Ligar e depressa; ler e que demora. Separar os dois faz com
+				// que um servico em baixo falhe em segundos em vez de queimar
+				// dez minutos de trabalho de fundo a nao receber nada.
+				'connect_timeout' => 15,
+				'timeout' => $this->readerTimeout(),
 			]);
 		} catch (\Throwable $e) {
 			$this->logger->warning('Falhou a leitura da fatura', ['exception' => $e, 'url' => $url]);
-			throw new InvoiceImportException(
-				'Nao foi possivel contactar o servico de leitura de faturas (' . $this->readerUrl() . ').'
+
+			// Distinguir "demorou demais" de "nao atendeu" poupa a quem le o
+			// erro ir procurar uma avaria que nao existe.
+			$timedOut = str_contains($e->getMessage(), 'cURL error 28')
+				|| str_contains(mb_strtolower($e->getMessage()), 'timed out');
+
+			throw new InvoiceImportException($timedOut
+				? sprintf(
+					'O servico de leitura demorou mais de %d segundos e o pedido foi abandonado. '
+					. 'PDF com muitas paginas demoram mais -- cada pagina e renderizada e '
+					. 'inspeccionada. Se for recorrente, aumenta "%s" na configuracao da app.',
+					$this->readerTimeout(), self::CONFIG_TIMEOUT
+				)
+				: 'Nao foi possivel contactar o servico de leitura de faturas (' . $this->readerUrl() . ').'
 			);
 		}
 

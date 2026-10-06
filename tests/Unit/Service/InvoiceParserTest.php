@@ -316,4 +316,156 @@ class InvoiceParserTest extends TestCase {
 
 		$this->assertContains('A pagina 3 nao pode ser renderizada.', $result['warnings']);
 	}
+
+	// ------------------------------------------------- Faturas de agua (ADRA)
+
+	private function waterLine(string $description, float $qty, string $unit, float $price, float $vat): array {
+		return [
+			'description' => $description, 'quantity' => $qty, 'unit' => $unit,
+			'unit_price' => $price, 'discount' => 0.0, 'vat_rate' => $vat / 100,
+			'net' => round($qty * $price, 4), 'raw' => ['page' => 1],
+		];
+	}
+
+	/**
+	 * A armadilha mais cara de uma fatura de agua: a taxa de recursos
+	 * hidricos e a de residuos sao cobradas POR m3 DE AGUA, e por isso
+	 * trazem a mesma quantidade que o consumo sem o serem. Numa fatura real,
+	 * somar tudo o que diz "m3" dava 126,582 m3 quando a casa gastou 25,833
+	 * -- quase cinco vezes mais.
+	 */
+	public function testTaxasCobradasPorM3NaoSaoConsumo(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->waterLine('Água (Tarifa Variável) - 1º Esc. Até 5 m3', 5.167, 'm3', 0.7167, 6),
+			$this->waterLine('Água (Tarifa Variável) - 2º Esc. > 5 m3', 10.333, 'm3', 1.1183, 6),
+			$this->waterLine('Água (Tarifa Variável) - 3º Esc. > 15 m3', 10.333, 'm3', 1.9189, 6),
+			$this->waterLine('Água (Tarifa Fixa)', 31, 'dias', 0.2252, 6),
+			$this->waterLine('Tx.Rec.Hídricos (Água)', 25.833, 'm3', 0.0285, 6),
+			$this->waterLine('Tx.Rec.Hídricos (SAN)', 23.25, 'm3', 0.0161, 6),
+			$this->waterLine('RU Variável', 25.833, 'm3', 0.16, 0),
+			$this->waterLine('Taxa Gestão de Resíduos', 25.833, 'm3', 0.3019, 6),
+		]));
+
+		$consumption = $result['documents'][0]['consumption'];
+		$this->assertCount(1, $consumption, 'os tres escaloes sao a mesma medicao');
+		$this->assertSame('TOTAL', $consumption[0]['registerCode']);
+		$this->assertEqualsWithDelta(25.833, $consumption[0]['quantity'], 0.001);
+	}
+
+	/**
+	 * Os escaloes sao faixas de PRECO da mesma medicao, nao medicoes
+	 * diferentes. Tratados como registos distintos, o contador de agua
+	 * passava a ter tres registos que nao existem.
+	 */
+	public function testEscaloesDeAguaSomamNoRegistoUnico(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->waterLine('Água (Tarifa Variável) - 1º Esc. Até 5 m3', 5.0, 'm3', 0.7167, 6),
+			$this->waterLine('Água (Tarifa Variável) - 2º Esc. > 5 m3', 7.5, 'm3', 1.1183, 6),
+			$this->waterLine('Água (Tarifa Fixa)', 31, 'dias', 0.2252, 6),
+		]));
+
+		$codes = array_column($result['documents'][0]['consumption'], 'registerCode');
+		$this->assertSame(['TOTAL'], $codes);
+		$this->assertSame(12.5, $result['documents'][0]['consumption'][0]['quantity']);
+	}
+
+	/**
+	 * Sem nenhuma linha cobrada ao dia nao ha duracao de onde deduzir o
+	 * periodo, e sem periodo o consumo nao entra. Fica avisado em vez de
+	 * entrar sem data.
+	 */
+	public function testSemLinhaAoDiaNaoHaPeriodoLogoNaoHaConsumo(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->waterLine('Água (Tarifa Variável) - 1º Esc.', 5.0, 'm3', 0.7167, 6),
+		], ['document' => ['date' => '2026-08-31']]));
+
+		$this->assertSame([], $result['documents'][0]['consumption']);
+		$this->assertFalse($result['documents'][0]['periodInferred']);
+		$this->assertStringContainsString('intervalo de datas', implode(' ', $result['warnings']));
+	}
+
+	public function testSaneamentoEResiduosSaoServicoNaoConsumo(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->waterLine('Água (Tarifa Variável) - 1º Esc. Até 5 m3', 5.0, 'm3', 0.7167, 6),
+			$this->waterLine('Água (Tarifa Fixa)', 31, 'dias', 0.2252, 6),
+			$this->waterLine('Saneamento (Trf.Variável)', 90, '%', 35.0866, 6),
+			$this->waterLine('Saneamento (Trf. Fixa)', 31, 'dias', 0.2401, 6),
+			$this->waterLine('RU Fixo', 31, 'dias', 0.1833, 0),
+		]));
+
+		$kinds = array_column($result['documents'][0]['lines'], 'kind');
+		$this->assertSame([
+			InvoiceParser::KIND_ENERGY,
+			InvoiceParser::KIND_POWER,
+			InvoiceParser::KIND_SERVICE,
+			InvoiceParser::KIND_SERVICE,
+			InvoiceParser::KIND_SERVICE,
+		], $kinds);
+		$this->assertSame(5.0, $result['documents'][0]['consumption'][0]['quantity']);
+	}
+
+	/**
+	 * Guarda independente da redaccao: o que e cobrado ao dia nao e medicao,
+	 * por mais que a descricao se pareca com consumo.
+	 */
+	public function testCobradoAoDiaNuncaEConsumo(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->waterLine('Água (Tarifa Variável) estranha', 31, 'dias', 0.2252, 6),
+		]));
+
+		$this->assertSame([], $result['documents'][0]['consumption']);
+		$this->assertSame(InvoiceParser::KIND_POWER, $result['documents'][0]['lines'][0]['kind']);
+	}
+
+	/**
+	 * A ADRA nao escreve o periodo em lado nenhum. Deduz-se a DURACAO das
+	 * linhas de tarifa fixa -- facto escrito na fatura -- e ancora-se na data
+	 * de emissao, que ja e suposicao e por isso sai avisada.
+	 */
+	public function testDeduzOPeriodoQuandoAFaturaNaoOEscreve(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->waterLine('Água (Tarifa Variável) - 1º Esc. Até 5 m3', 5.0, 'm3', 0.7167, 6),
+			$this->waterLine('Água (Tarifa Fixa)', 31, 'dias', 0.2252, 6),
+		], ['document' => ['date' => '2026-08-31']]));
+
+		$doc = $result['documents'][0];
+		$this->assertSame('2026-08-01', $doc['periodFrom']);
+		$this->assertSame('2026-08-31', $doc['periodTo']);
+		$this->assertTrue($doc['periodInferred']);
+		$this->assertSame(5.0, $doc['consumption'][0]['quantity']);
+		$this->assertStringContainsString('deduzido dos 31 dias', implode(' ', $result['warnings']));
+	}
+
+	/**
+	 * Se umas linhas tiverem datas e outras nao, as que nao tem sao
+	 * suspeitas -- foi assim que apareceu uma linha a mais numa fatura da
+	 * EDP. Dar-lhes o periodo do documento fa-las-ia entrar nos totais.
+	 */
+	public function testNaoDeduzQuandoHaLinhasComDatas(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->line('Consumo real Vazio 1 out a 31 out 2026', 43, 0.1119, 23),
+			$this->waterLine('Energia Fora Vazio', 82, '', 0.0835, 23),
+			$this->waterLine('Potência (3,45 kVA)', 31, 'dias', 0.4253, 23),
+		]));
+
+		$doc = $result['documents'][0];
+		$this->assertFalse($doc['periodInferred']);
+		$this->assertCount(1, $doc['consumption'], 'a linha sem datas fica de fora');
+		$this->assertSame(43.0, $doc['consumption'][0]['quantity']);
+	}
+
+	/**
+	 * Linhas ao dia que discordem entre si nao dao uma duracao. Nao se
+	 * escolhe uma a sorte.
+	 */
+	public function testNaoDeduzQuandoOsDiasDiscordam(): void {
+		$result = $this->parser->parse($this->payload([
+			$this->waterLine('Água (Tarifa Variável) - 1º Esc.', 5.0, 'm3', 0.7167, 6),
+			$this->waterLine('Água (Tarifa Fixa)', 31, 'dias', 0.2252, 6),
+			$this->waterLine('Saneamento (Trf. Fixa)', 22, 'dias', 0.2401, 6),
+		], ['document' => ['date' => '2026-08-31']]));
+
+		$this->assertFalse($result['documents'][0]['periodInferred']);
+		$this->assertSame([], $result['documents'][0]['consumption']);
+	}
 }

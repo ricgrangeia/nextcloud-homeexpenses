@@ -64,11 +64,28 @@ class InvoiceParser {
 		'simples' => 'TOTAL',
 	];
 
+	/** A quantidade medida: kWh de eletricidade, m3 de agua. */
 	public const KIND_ENERGY = 'energy';
+	/** Cobrado ao dia independentemente do consumo: potencia, tarifa fixa. */
 	public const KIND_POWER = 'power';
 	public const KIND_NETWORK = 'network';
+	/** Servico derivado do consumo medido, nao medido ele proprio: saneamento, residuos. */
+	public const KIND_SERVICE = 'service';
 	public const KIND_LEVY = 'levy';
 	public const KIND_OTHER = 'other';
+
+	/**
+	 * Unidades que um encargo medido nunca tem.
+	 *
+	 * Esta e a guarda mais util deste ficheiro. Numa fatura de agua, a taxa
+	 * de recursos hidricos e a de residuos sao cobradas POR m3 DE AGUA, por
+	 * isso trazem a mesma quantidade que o consumo sem o serem. Numa fatura
+	 * real, somar tudo o que diz "m3" dava 126,582 m3 quando a casa gastou
+	 * 25,833 -- quase cinco vezes mais. A unidade nao chega para distinguir
+	 * esses casos, mas apanha os outros dois: nada cobrado "ao dia" ou "em
+	 * percentagem" e uma medicao.
+	 */
+	private const NEVER_MEASURED_UNITS = ['dias', 'dia', '%'];
 
 	/**
 	 * @param array $full resposta de /api/v1/document/full
@@ -112,6 +129,18 @@ class InvoiceParser {
 				$warnings[] = (string)$warning;
 			}
 
+			// A EDP escreve o intervalo em cada linha; a ADRA nao escreve
+			// nenhum. Quando nao ha nenhum, deduz-se -- ver inferPeriod().
+			$inferred = $this->inferPeriod($lines, (string)($header['date'] ?? ''));
+			if ($inferred !== null) {
+				[$lines, $inferredFrom, $inferredTo, $inferredDays] = $inferred;
+				$warnings[] = sprintf(
+					'A fatura %s nao escreve o periodo. Foi deduzido dos %d dias da tarifa fixa, '
+					. 'a terminar na data de emissao: %s a %s. Corrige se nao bater.',
+					$header['number'] ?? '?', $inferredDays, $inferredFrom, $inferredTo
+				);
+			}
+
 			$documents[] = [
 				'atcud' => (string)($header['atcud'] ?? ''),
 				'supplier' => (string)($header['seller']['name'] ?? ''),
@@ -124,6 +153,7 @@ class InvoiceParser {
 				'verified' => $verified,
 				'periodFrom' => $this->earliest($lines),
 				'periodTo' => $this->latest($lines),
+				'periodInferred' => $inferred !== null,
 				// A referencia e a data-limite sao do ficheiro, nao do
 				// documento: um PDF com duas faturas tem um so pagamento.
 				'dueDate' => (string)($full['file']['payment']['due_date'] ?? ''),
@@ -162,6 +192,71 @@ class InvoiceParser {
 	}
 
 	/**
+	 * Preenche o intervalo quando a fatura nao o escreve.
+	 *
+	 * A EDP poe "29 ago a 19 set 2026" em cada linha; a ADRA nao poe nada. O
+	 * que a ADRA poe sao linhas de tarifa fixa cobradas "31 dias" -- e isso e
+	 * um facto escrito na fatura, nao um palpite: a tarifa fixa cobre
+	 * exactamente o periodo faturado. Dai sai a DURACAO. O fim ancora-se na
+	 * data de emissao, e isso ja e suposicao, por isso sai um aviso a dizer
+	 * de onde veio e a convidar a corrigir.
+	 *
+	 * So se deduz quando NENHUMA linha de consumo tem datas. Se umas tiverem
+	 * e outras nao, as que nao tem sao suspeitas -- foi assim que apareceu
+	 * uma linha a mais numa fatura da EDP -- e dar-lhes o periodo do
+	 * documento fa-las-ia entrar nos totais, que e precisamente o que nao se
+	 * quer.
+	 *
+	 * @return array{0: list<array>, 1: string, 2: string, 3: int}|null
+	 */
+	private function inferPeriod(array $lines, string $issuedAt): ?array {
+		if ($issuedAt === '') {
+			return null;
+		}
+
+		$energy = array_filter($lines, static fn (array $l) => $l['kind'] === self::KIND_ENERGY);
+		if ($energy === []) {
+			return null;
+		}
+		foreach ($energy as $line) {
+			if ($line['periodFrom'] !== null) {
+				return null;
+			}
+		}
+
+		// Os dias das linhas cobradas ao dia. Se discordarem entre si, nao ha
+		// uma duracao -- nao se escolhe uma a sorte.
+		$days = [];
+		foreach ($lines as $line) {
+			if (in_array($line['unit'] ?? '', ['dias', 'dia'], true) && $line['quantity'] !== null) {
+				$days[] = (int)round($line['quantity']);
+			}
+		}
+		$days = array_values(array_unique($days));
+		if (count($days) !== 1 || $days[0] < 1) {
+			return null;
+		}
+
+		try {
+			$to = new \DateTimeImmutable($issuedAt);
+		} catch (\Exception) {
+			return null;
+		}
+		$from = $to->modify('-' . ($days[0] - 1) . ' days');
+
+		$fromText = $from->format('Y-m-d');
+		$toText = $to->format('Y-m-d');
+		foreach ($lines as &$line) {
+			if ($line['kind'] === self::KIND_ENERGY && $line['periodFrom'] === null) {
+				$line['periodFrom'] = $fromText;
+				$line['periodTo'] = $toText;
+			}
+		}
+
+		return [$lines, $fromText, $toText, $days[0]];
+	}
+
+	/**
 	 * Diz qual das conferencias falhou, para o aviso nao ser so "nao fecha".
 	 */
 	private function whyNot(array $verification): string {
@@ -184,16 +279,38 @@ class InvoiceParser {
 	private function classify(array $row): array {
 		$description = (string)($row['description'] ?? '');
 		$lower = $this->fold($description);
+		$unit = mb_strtolower(trim((string)($row['unit'] ?? '')));
 
 		$kind = self::KIND_OTHER;
 		$registerCode = null;
 		$isEstimate = false;
 
-		if (str_contains($lower, 'consumo')) {
+		// A ordem destes testes e o que impede uma taxa de ser contada como
+		// consumo. Os mais especificos primeiro: "Tx.Rec.Hidricos (Agua)"
+		// contem "agua", e "Taxa Gestao de Residuos" contem "residuos" --
+		// testados pela ordem errada, entravam no consumo da casa.
+		if ($this->isLevy($lower)) {
+			$kind = self::KIND_LEVY;
+		} elseif (str_contains($lower, 'saneamento') || $this->isWaste($lower)) {
+			// Saneamento e residuos sao cobrados a partir do consumo de agua
+			// -- 90% do volume, no caso do saneamento -- mas nao sao agua
+			// consumida. Contam para o custo, nunca para o consumo.
+			$kind = self::KIND_SERVICE;
+		} elseif (str_contains($lower, 'agua')) {
+			// Agua ao m3 vem repartida por escaloes de preco. Os escaloes sao
+			// faixas de tarifacao da MESMA medicao, nao medicoes diferentes:
+			// somam-se todos no registo unico do contador.
+			if (str_contains($lower, 'fixa')) {
+				$kind = self::KIND_POWER;
+			} else {
+				$kind = self::KIND_ENERGY;
+				$registerCode = 'TOTAL';
+			}
+		} elseif (str_contains($lower, 'consumo')) {
 			$kind = self::KIND_ENERGY;
-			// "Consumo estimado" existe e tem de se distinguir de "Consumo real":
-			// uma estimativa da distribuidora misturada com leituras reais
-			// estraga medias e previsoes.
+			// "Consumo estimado" existe e tem de se distinguir de "Consumo
+			// real": uma estimativa da distribuidora misturada com leituras
+			// reais estraga medias e previsoes.
 			$isEstimate = str_contains($lower, 'estimado');
 			$registerCode = $this->register($lower);
 		} elseif (str_contains($lower, 'energia')) {
@@ -203,8 +320,14 @@ class InvoiceParser {
 			$kind = self::KIND_POWER;
 		} elseif (str_contains($lower, 'redes') || str_contains($lower, 'acesso')) {
 			$kind = self::KIND_NETWORK;
-		} elseif ($this->isLevy($lower)) {
-			$kind = self::KIND_LEVY;
+		}
+
+		// Ultima guarda, independente da redaccao: o que e cobrado ao dia ou
+		// em percentagem nao e uma medicao, por mais que a descricao o
+		// pareca. Rebaixa-se em vez de se deixar entrar no consumo.
+		if ($kind === self::KIND_ENERGY && in_array($unit, self::NEVER_MEASURED_UNITS, true)) {
+			$kind = $unit === '%' ? self::KIND_SERVICE : self::KIND_POWER;
+			$registerCode = null;
 		}
 
 		[$from, $to] = $this->period($description);
@@ -217,13 +340,21 @@ class InvoiceParser {
 			'periodFrom' => $from,
 			'periodTo' => $to,
 			'quantity' => $this->float($row['quantity'] ?? null),
-			'unit' => isset($row['unit']) ? (string)$row['unit'] : null,
+			'unit' => $unit === '' ? null : $unit,
 			'unitPrice' => $this->float($row['unit_price'] ?? null),
 			'discount' => $this->float($row['discount'] ?? null),
 			'vatRate' => $this->vatPercent($row['vat_rate'] ?? null),
 			'totalNet' => $this->float($row['net'] ?? null),
 			'page' => (int)($row['raw']['page'] ?? $row['page'] ?? 0),
 		];
+	}
+
+	/**
+	 * Residuos urbanos. "RU" e curto demais para str_contains -- apanharia
+	 * qualquer palavra que o contenha -- por isso vai com fronteira.
+	 */
+	private function isWaste(string $lower): bool {
+		return preg_match('/\bru\b/u', $lower) === 1 || str_contains($lower, 'residuo');
 	}
 
 	private function register(string $lower): ?string {
@@ -236,12 +367,13 @@ class InvoiceParser {
 	}
 
 	private function isLevy(string $lower): bool {
-		foreach (['iec', 'dgeg', 'audiovisual', 'imposto'] as $needle) {
+		foreach (['audiovisual', 'imposto', 'hidricos', 'tx.rec', 'taxa gestao'] as $needle) {
 			if (str_contains($lower, $needle)) {
 				return true;
 			}
 		}
-		return false;
+		// "iec" e "dgeg" sao curtos e apareceriam dentro de outras palavras.
+		return preg_match('/\b(iec|dgeg)\b/u', $lower) === 1;
 	}
 
 	/**
