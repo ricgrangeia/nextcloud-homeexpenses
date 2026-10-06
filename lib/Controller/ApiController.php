@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace OCA\HomeExpenses\Controller;
 
+use OCA\HomeExpenses\Service\ForecastService;
 use OCA\HomeExpenses\Service\GasService;
 use OCA\HomeExpenses\Service\InvoiceImportException;
 use OCA\HomeExpenses\Service\InvoiceService;
@@ -42,6 +43,7 @@ class ApiController extends OCSController {
 		private GasService $gasService,
 		private TariffService $tariffService,
 		private InvoiceService $invoiceService,
+		private ForecastService $forecastService,
 		private IUserSession $userSession,
 	) {
 		parent::__construct($appName, $request);
@@ -114,6 +116,7 @@ class ApiController extends OCSController {
 				'GET /api/v1/invoices/{id}' => 'Uma fatura: as linhas como vieram do fornecedor, mais o consumo agregado.',
 				'PUT /api/v1/invoices/{id}' => 'Liga a fatura a um contador (meterId), ou desliga com meterId nulo.',
 				'DELETE /api/v1/invoices/{id}' => 'Apaga a fatura e as suas linhas.',
+				'GET /api/v1/meters/{id}/forecast' => 'Projecta consumo e custo para os proximos "days" dias (por omissao 30). Usa leituras e faturas sem as somar -- periodos sobrepostos contam uma vez, e ganha a leitura. LE "confidence" e "caveats" ANTES de usar os numeros: com base insuficiente devolve "projected" nulo, e nesse caso nao ha numero nenhum a extrair daqui. O custo so vem se houver fatura importada deste contador.',
 				['method' => 'GET', 'path' => '/api/v1/overview', 'summary' => 'Tudo de uma vez: contadores com ultima leitura, garrafas em uso e medias'],
 				['method' => 'GET', 'path' => '/api/v1/meters', 'summary' => 'Listar contadores (?kind=electricity|water, ?includeArchived=true)'],
 				['method' => 'POST', 'path' => '/api/v1/meters', 'summary' => 'Criar contador (name, kind, unit, tariffOption simples|bi|tri, registerCodes[], location, serial, digits, installedAt)'],
@@ -729,5 +732,66 @@ class ApiController extends OCSController {
 		} catch (DoesNotExistException) {
 			return $this->notFound();
 		}
+	}
+
+	// --------------------------------------------------------------- Previsao
+
+	/**
+	 * Projecta consumo e custo para os proximos dias.
+	 *
+	 * Usa as duas fontes -- leituras do contador e faturas importadas -- sem
+	 * as somar: um periodo de leituras que se sobreponha a uma fatura e o
+	 * mesmo consumo contado duas vezes. Ganha a leitura, que vem do mostrador
+	 * e traz os escaloes todos.
+	 *
+	 * O custo so aparece se houver uma fatura de onde o derivar: sem ela
+	 * sabe-se o preco da energia mas nao o da potencia, do acesso as redes nem
+	 * dos impostos, que sao mais de metade do que se paga.
+	 *
+	 * LE SEMPRE `caveats` e `confidence`. Esta resposta devolve `projected`
+	 * nulo quando nao ha base que chegue, e nesse caso nao ha numero nenhum a
+	 * extrair daqui.
+	 */
+	#[NoAdminRequired]
+	#[ApiRoute(verb: 'GET', url: '/api/v1/meters/{id}/forecast')]
+	public function forecast(int $id, int $days = 30): DataResponse {
+		$userId = $this->getUserId();
+		$days = max(1, min($days, 730));
+
+		try {
+			$detail = $this->readingService->detail($id, $userId);
+		} catch (DoesNotExistException) {
+			return $this->notFound();
+		}
+
+		$fromReadings = $this->forecastService->fromSeries($detail['series']['periods'] ?? []);
+		$fromInvoices = $this->forecastService->fromInvoices(
+			$this->invoiceService->consumptionSeries($userId, $id)
+		);
+		$merged = $this->forecastService->merge($fromReadings, $fromInvoices);
+
+		$costModel = null;
+		$priced = $this->invoiceService->latestPricedInvoice($userId, $id);
+		if ($priced !== null) {
+			$costModel = $this->forecastService->costModelFromInvoice($priced['lines'], $priced['days']);
+		}
+
+		$forecast = $this->forecastService->forecast(
+			$merged['periods'],
+			$this->today()->format('Y-m-d'),
+			$days,
+			$costModel
+		);
+
+		if ($costModel === null) {
+			$forecast['caveats'][] = 'Nao ha nenhuma fatura importada para este contador, por isso nao '
+				. 'se projecta custo -- so consumo. Importa uma fatura para a app saber quanto custam a '
+				. 'potencia, o acesso as redes e os impostos.';
+		}
+
+		return new DataResponse($forecast + [
+			'sources' => $merged['used'],
+			'costModelFrom' => $priced['invoice'] ?? null,
+		]);
 	}
 }

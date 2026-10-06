@@ -169,6 +169,75 @@ class InvoiceService {
 		return $out;
 	}
 
+	/**
+	 * O consumo de todas as faturas de um contador, para alimentar previsoes.
+	 *
+	 * So entram documentos verificados: um documento cujas contas nao fecham
+	 * fica guardado, mas nao serve de base a calculo nenhum.
+	 *
+	 * @return list<array>
+	 */
+	public function consumptionSeries(string $userId, ?int $meterId = null): array {
+		$invoices = $this->invoices->findAll($userId, $meterId);
+		$byInvoice = $this->lines->findAllForInvoices(
+			array_map(static fn (Invoice $i) => $i->getId(), $invoices)
+		);
+
+		$out = [];
+		foreach ($invoices as $invoice) {
+			if (!$invoice->getVerified()) {
+				continue;
+			}
+			foreach ($this->consumptionOf($byInvoice[$invoice->getId()] ?? []) as $entry) {
+				$out[] = $entry;
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * As linhas da fatura mais recente que tenha energia, para se derivar
+	 * delas um modelo de custo.
+	 *
+	 * Escolhe-se a mais recente e nao uma media de varias: precos de energia
+	 * mudam, e uma media de precos velhos com precos novos nao corresponde a
+	 * nenhum momento real.
+	 *
+	 * @return array{lines: list<array>, days: int, invoice: array}|null
+	 */
+	public function latestPricedInvoice(string $userId, ?int $meterId = null): ?array {
+		$invoices = $this->invoices->findAll($userId, $meterId);
+		$byInvoice = $this->lines->findAllForInvoices(
+			array_map(static fn (Invoice $i) => $i->getId(), $invoices)
+		);
+
+		foreach (array_reverse($invoices) as $invoice) {
+			if (!$invoice->getVerified()) {
+				continue;
+			}
+			$lines = $byInvoice[$invoice->getId()] ?? [];
+			$hasEnergy = false;
+			$plain = [];
+			foreach ($lines as $line) {
+				$plain[] = $line->jsonSerialize();
+				$hasEnergy = $hasEnergy
+					|| ($line->getKind() === InvoiceParser::KIND_ENERGY && $line->getUnitPrice() !== null);
+			}
+			if (!$hasEnergy) {
+				continue;
+			}
+
+			$from = $invoice->getPeriodFrom();
+			$to = $invoice->getPeriodTo();
+			$days = $from !== null && $to !== null ? max(1, (int)$from->diff($to)->days) : 30;
+
+			return ['lines' => $plain, 'days' => $days, 'invoice' => $invoice->jsonSerialize()];
+		}
+
+		return null;
+	}
+
 	/** @throws DoesNotExistException */
 	public function delete(int $id, string $userId): void {
 		$invoice = $this->invoices->find($id, $userId);
